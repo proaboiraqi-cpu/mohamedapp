@@ -112,7 +112,9 @@ h1,h2,h3,h4,p{margin:0}
 .s-flash svg{width:44px;height:44px}
 .s-flash.go{animation:flash .55s ease-out}
 @keyframes flash{0%{opacity:1;transform:scale(.8)}100%{opacity:0;transform:scale(1.25)}}
-#short-mute{position:absolute;top:calc(10px + var(--safe-t));left:10px;z-index:3;background:#0005}
+#short-mute,#short-back{position:absolute;top:calc(10px + var(--safe-t));z-index:3;background:#0005}
+#short-mute{left:10px}
+#short-back{right:10px}
 
 /* ---------- صفحة أنت ---------- */
 .you-head{display:flex;align-items:center;gap:16px;padding:18px 16px}
@@ -269,7 +271,7 @@ h1,h2,h3,h4,p{margin:0}
   padding:3px 8px;font-size:12px;direction:rtl}
 .ad-tag b{background:#fbc02d;color:#000;border-radius:3px;padding:0 5px;font-weight:700;font-size:11px}
 .ad-left{direction:ltr;font-variant-numeric:tabular-nums;margin-inline-start:6px}
-#view-shorts .ad-tag{top:calc(14px + var(--safe-t));right:12px}
+#view-shorts .ad-tag{top:calc(14px + var(--safe-t));right:62px}
 .ad-skip{position:absolute;right:10px;bottom:72px;background:#000b;border:1px solid #ffffff55;border-radius:4px;
   padding:9px 16px;font-weight:600;font-size:13px;color:#ffffffb0}
 .ad-skip.ready{background:#fff;color:#000;border-color:#fff}
@@ -294,3 +296,8 @@ h1,h2,h3,h4,p{margin:0}
 .adact .ghost{padding:7px 14px;font-size:13px}
 .prev{width:min(94vw,440px);display:flex;flex-direction:column;gap:12px}
 .prev-box{position:relative;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden}
+
+/* ---------- وضع خفيف (جهاز الطفل): نفس الشكل بدون مؤثرات ثقيلة ---------- */
+.lite *:not(#p-spin):not(#p-spin *){transition:none!important;animation:none!important;box-shadow:none!important;text-shadow:none!important}
+.lite svg{filter:none!important}
+.lite .s-shade,.lite .p-overlay{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}

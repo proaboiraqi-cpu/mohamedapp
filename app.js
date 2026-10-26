@@ -15,6 +15,7 @@ if (LS.get('code', null) === null) LS.set('code', '1234');
 const channel = () => LS.get('channel', 'الفيديوهات');
 const chInitial = () => (channel().trim()[0] || 'ي');
 const KID = () => LS.get('kid', '0') === '1';
+const applyLite = () => document.body.classList.toggle('lite', KID());
 const lsJSON = (k, d) => { try { return JSON.parse(LS.get(k, '')) || d; } catch (e) { return d; } };
 const CL = window.CLOUD || { ok: false, offset: 0, now: () => Date.now() };
 const withTimeout = (p, ms = 10000) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
@@ -69,6 +70,7 @@ const P = {
   full: 'M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z',
   close: 'M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
   down: 'M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z',
+  back: 'M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z',
   volume: 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z',
   mute: 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z',
   trash: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
@@ -209,15 +211,23 @@ function frameThumb(img, v) {
   img.style.visibility = 'hidden';
   return true;
 }
+const thumbObs = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    const img = e.target; thumbObs.unobserve(img);
+    loadThumb(img);
+  }
+}, { rootMargin: '500px 0px 500px 0px' });
+async function loadThumb(img) {
+  const v = state.byId.get(img.dataset.vid);
+  if (!v) return;
+  let u = null;
+  try { u = await thumbURL(v); } catch (e) {}
+  if (u) { img.decoding = 'async'; img.onerror = () => { img.style.visibility = 'hidden'; frameThumb(img, v); }; img.src = u; }
+  else if (!frameThumb(img, v)) img.style.visibility = 'hidden';
+}
 function fillThumbs(root) {
-  $$('img[data-vid]', root).forEach(async img => {
-    const v = state.byId.get(img.dataset.vid);
-    if (!v) return;
-    let u = null;
-    try { u = await thumbURL(v); } catch (e) {}
-    if (u) { img.onerror = () => { img.style.visibility = 'hidden'; frameThumb(img, v); }; img.src = u; }
-    else if (!frameThumb(img, v)) img.style.visibility = 'hidden';
-  });
+  $$('img[data-vid]', root).forEach(img => thumbObs.observe(img));
 }
 // فيديوهات الهاتف اللي ما إلها صورة مصغرة: نطلعها بالخلفية
 async function ensureThumbs() {
@@ -256,21 +266,44 @@ function shelfHTML(S) {
     S.map(v => `<div class="scard" data-short="${v.id}"><img alt="" data-vid="${v.id}"><div class="stitle">${esc(v.title)}</div></div>`).join('')
   }</div></section>`;
 }
+let homeL = [], homeS = [], homeShown = 0;
+const homePage = () => (KID() ? 6 : 10);
 function renderHome() {
   const box = $('#home-list');
   const q = state.query.trim().toLowerCase();
   let L = byRank(longs()), S = byRank(shorts());
   if (q) { L = L.filter(v => v.title.toLowerCase().includes(q)); S = []; }
+  homeL = L; homeS = S; homeShown = 0;
   if (!L.length && !S.length) {
     box.innerHTML = `<div class="empty">${logo(64)}<div>${q ? 'لا توجد نتائج' : 'لا توجد فيديوهات'}</div></div>`;
     return;
   }
-  let html = '';
-  L.forEach((v, i) => { html += cardHTML(v); if (i === 1 && S.length) html += shelfHTML(S); });
-  if (L.length < 2 && S.length) html += shelfHTML(S);
-  box.innerHTML = html;
-  fillThumbs(box);
+  box.innerHTML = '';
+  addHomeBatch();
 }
+// يضيف دفعة جديدة من الفيديوهات كلما قرّب المستخدم من نهاية الصفحة
+function addHomeBatch() {
+  const box = $('#home-list');
+  if (homeShown >= homeL.length && !(homeShown === 0 && homeS.length)) return;
+  const end = Math.min(homeShown + homePage(), homeL.length);
+  let html = '';
+  for (let i = homeShown; i < end; i++) {
+    html += cardHTML(homeL[i]);
+    if (i === 1 && homeS.length) html += shelfHTML(homeS);
+  }
+  if (homeL.length < 2 && homeS.length && homeShown === 0) html += shelfHTML(homeS);
+  homeShown = end;
+  const w = document.createElement('div');
+  w.style.display = 'contents';
+  w.innerHTML = html;
+  box.appendChild(w);
+  fillThumbs(w);
+}
+$('#view-home').addEventListener('scroll', () => {
+  if (homeShown >= homeL.length) return;
+  const v = $('#view-home');
+  if (v.scrollTop + v.clientHeight > v.scrollHeight - 900) addHomeBatch();
+}, { passive: true });
 
 /* ================= الإعلانات ================= */
 function adLogGet() {
@@ -434,7 +467,7 @@ function pauseShorts() {
 }
 const loadObs = new IntersectionObserver(entries => {
   for (const e of entries) { if (e.isIntersecting) attachShort(e.target); else detachShort(e.target); }
-}, { root: feed, rootMargin: '100% 0px 100% 0px', threshold: 0 });
+}, { root: feed, rootMargin: KID() ? '30% 0px 30% 0px' : '100% 0px 100% 0px', threshold: 0 });
 const playObs = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target, vd = $('video', s);
@@ -520,6 +553,10 @@ $('#short-mute').addEventListener('click', () => {
   if (activeShort) $('video', activeShort).muted = state.muted;
 });
 function goShort(id) { setTab('shorts', { first: id }); }
+// زر الرجوع (بالأعلى يمين): يطلع من Shorts للرئيسية
+$('#short-back').addEventListener('click', () => {
+  if (history.state && history.state.s) history.back(); else setTab('home', { fromPop: true });
+});
 
 /* ================= أنت ================= */
 function hcardHTML(v) {
@@ -788,7 +825,17 @@ function setTab(t, opt = {}) {
   if (prev === t && t === 'home' && opt.refresh !== false) {
     homeRank.clear(); renderHome(); $('#view-home').scrollTo({ top: 0, behavior: 'smooth' });
   }
-  if (t === 'shorts' && !$('#watch').hidden) closeWatch();
+  let replaced = false;
+  if (t === 'shorts' && !$('#watch').hidden) {
+    const hadW = history.state && history.state.w;
+    cleanupWatch();
+    if (hadW) { history.replaceState({ s: 1 }, ''); replaced = true; }
+  }
+  if (t === 'shorts' && prev !== 'shorts' && !replaced) history.pushState({ s: 1 }, '');
+  else if (prev === 'shorts' && t !== 'shorts' && !opt.fromPop && history.state && history.state.s) {
+    W.skipPop = true; setTimeout(() => { W.skipPop = false; }, 700);
+    history.back();
+  }
   state.tab = t;
   $$('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + t));
   $$('#bottomnav [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
@@ -830,6 +877,7 @@ window.addEventListener('popstate', () => {
   if (W.skipPop) { W.skipPop = false; return; }
   if (!$('#watch').hidden && !W.mini) { if (W.ad) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
   else if (!$('#admin').hidden) hideAdmin();
+  else if (state.tab === 'shorts') setTab('home', { fromPop: true, refresh: false }); // الرجوع من Shorts يرجع للرئيسية
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { W.vid.pause(); $$('.short video').forEach(v => v.pause()); if (W.ad) W.ad.pause(); }
@@ -890,7 +938,7 @@ function probeVideo(src, opt) {
 }
 const blobToDataURL = b => new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(''); r.readAsDataURL(b); });
 // صورة مصغرة صغيرة تنحفظ بالسحابة (نص صغير بدل ملف)
-async function smallThumb(blob, max = 360) {
+async function smallThumb(blob, max = 320) {
   try {
     const url = URL.createObjectURL(blob);
     const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
@@ -899,7 +947,7 @@ async function smallThumb(blob, max = 360) {
     const c = document.createElement('canvas');
     c.width = Math.max(1, Math.round(img.width * sc)); c.height = Math.max(1, Math.round(img.height * sc));
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    return c.toDataURL('image/jpeg', 0.7);
+    return c.toDataURL('image/jpeg', 0.65);
   } catch (e) { return ''; }
 }
 async function downloadBlob(url, onProgress) {
@@ -1230,7 +1278,7 @@ async function doAdd(isFile, url) {
     setStatus('جاري فحص الفيديو…');
     if (meta.hasBlob) { const u = URL.createObjectURL(blobs.video); probe = await probeVideo(u); URL.revokeObjectURL(u); }
     else {
-      probe = await probeVideo(url, { cors: true, max: toCloud ? 360 : 640, q: toCloud ? 0.7 : 0.82 });
+      probe = await probeVideo(url, { cors: true, max: toCloud ? 320 : 640, q: toCloud ? 0.65 : 0.82 });
       if (!probe.duration) probe = await probeVideo(url, { thumb: false });
     }
     if (probe && probe.w && probe.h && !adm.kindTouched) meta.kind = probe.h > probe.w ? 'short' : 'long';
@@ -1443,7 +1491,7 @@ function buildCtl() {
     } catch (x) { toast('تعذر الإرسال'); }
   };
   $('#ctl-iskid').onchange = e => {
-    LS.set('kid', e.target.checked ? '1' : '0');
+    LS.set('kid', e.target.checked ? '1' : '0'); applyLite();
     if (e.target.checked) startBeat(); else stopBeat();
     applyCtl(); refreshAll();
     toast(e.target.checked ? 'هذا الجهاز صار جهاز الطفل' : 'رجع جهاز عادي');
@@ -1469,6 +1517,7 @@ async function init() {
   setMuteIcon();
   try { db = await openDB(); }
   catch (e) { $('#home-list').innerHTML = '<div class="empty">تعذر فتح التخزين</div>'; return; }
+  applyLite();
   state.cloud = lsJSON('cv', []); state.cloudAds = lsJSON('ca', []); state.ctl = lsJSON('cc', {});
   await loadVideos();
   await loadAds();
