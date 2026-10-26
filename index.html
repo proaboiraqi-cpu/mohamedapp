@@ -67,6 +67,12 @@
     <div id="p-skip" hidden></div>
   </div>
 
+  <div class="mini-bar">
+    <div class="mini-title" id="mini-title"></div>
+    <button class="icon-btn" id="mini-toggle" aria-label="تشغيل"></button>
+    <button class="icon-btn" id="mini-close" aria-label="إغلاق" data-ico="close"></button>
+  </div>
+
   <div class="watch-info">
     <div class="w-head">
       <h1 id="w-title"></h1>
@@ -88,6 +94,14 @@
     </div>
     <div id="w-next"></div>
   </div>
+  <div class="mini-prog"><i id="mini-prog"></i></div>
+</div>
+
+<!-- شاشة الإيقاف (جهاز الطفل) -->
+<div id="lock" hidden>
+  <div id="lock-logo" data-logo="64"></div>
+  <h2>الموقع متوقف حالياً</h2>
+  <p>ارجع بعد شوية</p>
 </div>
 
 <!-- الإدارة (مخفية) -->
@@ -95,6 +109,9 @@
 <div id="modal" hidden></div>
 <div id="toast"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js" crossorigin="anonymous"></script>
+<script src="cloud.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

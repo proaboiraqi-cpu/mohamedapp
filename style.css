@@ -134,7 +134,7 @@ h1,h2,h3,h4,p{margin:0}
 
 /* ---------- صفحة المشاهدة ---------- */
 #watch{position:fixed;inset:0;z-index:20;background:var(--bg);display:flex;flex-direction:column;padding-top:var(--safe-t)}
-.player{position:relative;flex:none;width:100%;aspect-ratio:16/9;background:#000;overflow:hidden}
+.player{position:relative;flex:none;width:100%;aspect-ratio:16/9;background:#000;overflow:hidden;touch-action:none}
 .player:fullscreen{aspect-ratio:auto;width:100%;height:100%}
 .player video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
 .p-overlay{position:absolute;inset:0;background:linear-gradient(#0009,#0000 35%,#0000 60%,#000a)}
@@ -162,7 +162,7 @@ h1,h2,h3,h4,p{margin:0}
 #p-skip.R{right:10%}
 @keyframes fadeout{0%{opacity:1}70%{opacity:1}100%{opacity:0}}
 
-.watch-info{flex:1;overflow-y:auto;overscroll-behavior:contain;padding-bottom:var(--safe-b)}
+.watch-info{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding-bottom:var(--safe-b)}
 .w-head{padding:12px 12px 6px}
 .w-head h1{font-size:18px;font-weight:600;line-height:1.4}
 .w-meta{color:var(--text2);font-size:12px;margin-top:4px}
@@ -180,10 +180,33 @@ h1,h2,h3,h4,p{margin:0}
 .w-chname b{font-size:15px}
 
 @media (orientation:landscape) and (max-height:520px){
-  #watch{padding-top:0}
-  #watch .player{position:fixed;inset:0;aspect-ratio:auto;height:100%}
-  #watch .watch-info{display:none}
+  #watch:not(.mini){padding-top:0}
+  #watch:not(.mini) .player{position:fixed;inset:0;aspect-ratio:auto;height:100%}
+  #watch:not(.mini) .watch-info{display:none}
 }
+
+/* ---------- المشغل المصغّر ---------- */
+.mini-bar,.mini-prog{display:none}
+#watch.mini{inset:auto 0 calc(56px + var(--safe-b)) 0;height:62px;flex-direction:row;align-items:stretch;padding-top:0;
+  background:#212121;border-top:1px solid #333;cursor:pointer;animation:miniin .22s ease-out}
+@keyframes miniin{from{transform:translateY(24px);opacity:.4}to{transform:none;opacity:1}}
+#watch.mini .player{width:112px;height:62px;aspect-ratio:auto;flex:none}
+#watch.mini .p-overlay,#watch.mini #p-skip,#watch.mini #p-spin{display:none}
+#watch.mini .watch-info{display:none}
+#watch.mini .mini-bar{display:flex;flex:1;min-width:0;align-items:center;padding:0 0 0 4px}
+#watch.mini .mini-prog{display:block;position:absolute;left:0;right:0;bottom:0;height:2px;background:#ffffff33;direction:ltr}
+.mini-prog i{display:block;height:100%;width:0;background:var(--red)}
+.mini-title{flex:1;min-width:0;padding:0 12px;font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini-bar .icon-btn svg{width:26px;height:26px}
+.has-mini .view{bottom:62px}
+
+/* ---------- تحكم الطفل ---------- */
+#lock{position:fixed;inset:0;z-index:25;background:#0f0f0f;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--text2);text-align:center}
+#lock h2{color:var(--text);font-size:20px}
+#kidad{position:fixed;inset:0;z-index:50;background:#000}
+.adm-card select{width:100%;background:var(--bg2);color:var(--text);border:1px solid transparent;border-radius:10px;padding:11px 12px;margin:6px 0;outline:none;font-size:15px}
+#ctl-seen{color:var(--text2);font-size:13px;margin:2px 0 6px}
+.thumb video,.scard video,.arow .at video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;background:#222}
 
 /* ---------- الإدارة ---------- */
 #admin{position:fixed;inset:0;z-index:30;background:var(--bg);display:flex;flex-direction:column;padding-top:var(--safe-t)}

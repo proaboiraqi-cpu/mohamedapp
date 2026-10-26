@@ -14,6 +14,10 @@ const LS = {
 if (LS.get('code', null) === null) LS.set('code', '1234');
 const channel = () => LS.get('channel', 'الفيديوهات');
 const chInitial = () => (channel().trim()[0] || 'ي');
+const KID = () => LS.get('kid', '0') === '1';
+const lsJSON = (k, d) => { try { return JSON.parse(LS.get(k, '')) || d; } catch (e) { return d; } };
+const CL = window.CLOUD || { ok: false, offset: 0, now: () => Date.now() };
+const withTimeout = (p, ms = 10000) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 
 let toastT;
 function toast(msg) {
@@ -133,7 +137,7 @@ async function deleteVideo(id) {
   thumbCache.delete(id);
 }
 
-const state = { videos: [], byId: new Map(), ads: [], tab: 'home', query: '', muted: false };
+const state = { videos: [], all: [], local: [], cloud: [], byId: new Map(), ads: [], localAds: [], cloudAds: [], ctl: {}, tab: 'home', query: '', muted: false };
 function shuffle(a) {
   const b = a.slice();
   for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j], b[i]]; }
@@ -145,16 +149,34 @@ const byRank = arr => arr.slice().sort((a, b) => rank(a.id) - rank(b.id));
 const longs = () => state.videos.filter(v => v.kind !== 'short');
 const shorts = () => state.videos.filter(v => v.kind === 'short');
 
-async function loadVideos() {
-  const all = await reqP(store('videos').getAll());
-  all.sort((a, b) => b.created - a.created);
-  state.videos = all;
-  state.byId = new Map(all.map(v => [v.id, v]));
+// الطفل: يشوف حسب أوامر التحكم (كل شيء / محتوى محدد / موقوف)
+function isVisible(v) {
+  if (!KID()) return true;
+  const c = state.ctl || {};
+  if (c.mode === 'locked') return false;
+  if (c.mode === 'only') return !!(c.allowed && c.allowed[v.id]);
+  return true;
 }
-
+function rebuildVideos() {
+  const m = new Map();
+  state.local.forEach(v => m.set(v.id, v));
+  state.cloud.forEach(v => m.set(v.id, Object.assign({}, v, { cloud: true, src: 'url' })));
+  const all = Array.from(m.values()).sort((a, b) => b.created - a.created);
+  state.all = all;
+  state.byId = new Map(all.map(v => [v.id, v]));
+  state.videos = all.filter(isVisible);
+}
+async function loadVideos() {
+  state.local = await reqP(store('videos').getAll());
+  rebuildVideos();
+}
+function rebuildAds() {
+  state.ads = state.localAds.concat(state.cloudAds).sort((a, b) => b.created - a.created);
+}
 async function loadAds() {
-  try { const all = await reqP(store('ads').getAll()); all.sort((a, b) => b.created - a.created); state.ads = all; }
-  catch (e) { state.ads = []; }
+  try { state.localAds = await reqP(store('ads').getAll()); }
+  catch (e) { state.localAds = []; }
+  rebuildAds();
 }
 
 const thumbCache = new Map();
@@ -175,15 +197,46 @@ async function getVideoSrc(v) {
   }
   return { url: v.url, obj: false };
 }
+// إذا ما اكو صورة مصغرة: نعرض أول لقطة من الفيديو نفسه (تشتغل حتى بدون CORS)
+function frameThumb(img, v) {
+  if (!v.url || img.dataset.fb) return false;
+  img.dataset.fb = '1';
+  const vd = document.createElement('video');
+  vd.muted = true; vd.preload = 'metadata'; vd.playsInline = true;
+  vd.setAttribute('playsinline', '');
+  vd.src = v.url + '#t=0.6';
+  img.parentNode.insertBefore(vd, img);
+  img.style.visibility = 'hidden';
+  return true;
+}
 function fillThumbs(root) {
   $$('img[data-vid]', root).forEach(async img => {
     const v = state.byId.get(img.dataset.vid);
     if (!v) return;
     let u = null;
     try { u = await thumbURL(v); } catch (e) {}
-    if (u) { img.onerror = () => { img.style.visibility = 'hidden'; }; img.src = u; }
-    else img.style.visibility = 'hidden';
+    if (u) { img.onerror = () => { img.style.visibility = 'hidden'; frameThumb(img, v); }; img.src = u; }
+    else if (!frameThumb(img, v)) img.style.visibility = 'hidden';
   });
+}
+// فيديوهات الهاتف اللي ما إلها صورة مصغرة: نطلعها بالخلفية
+async function ensureThumbs() {
+  let changed = false;
+  for (const v of state.local.slice()) {
+    if (v.hasThumb || v.thumbUrl || !v.hasBlob) continue;
+    try {
+      const b = await reqP(store('blobs').get(v.id + ':video')); if (!b) continue;
+      const u = URL.createObjectURL(b);
+      const p = await probeVideo(u); URL.revokeObjectURL(u);
+      if (!p.thumb) continue;
+      const tx = db.transaction(['videos', 'blobs'], 'readwrite');
+      tx.objectStore('blobs').put(p.thumb, v.id + ':thumb');
+      tx.objectStore('videos').put(Object.assign({}, v, { hasThumb: true, duration: v.duration || p.duration }));
+      await txDone(tx);
+      thumbCache.delete(v.id); changed = true;
+    } catch (e) {}
+  }
+  if (changed) { await loadVideos(); refreshAll(); }
 }
 
 async function addHistory(id) {
@@ -235,9 +288,9 @@ function inWindow(a, mins) {
   if (f === t) return true;
   return f < t ? (mins >= f && mins < t) : (mins >= f || mins < t);
 }
-// يختار إعلان مناسب لهذا الفيديو (فقط إذا الفيديو أطول من دقيقة)
+// يختار إعلان مناسب لهذا الفيديو (أي فيديو، حتى لو أقل من دقيقة)
 function pickAd(v) {
-  if (!v || !(v.duration > 60) || !state.ads.length) return null;
+  if (!v || !state.ads.length) return null;
   const d = new Date(), mins = d.getHours() * 60 + d.getMinutes(), log = adLogGet();
   const ok = state.ads.filter(a => a.enabled !== false
     && (a.target !== 'videos' || (a.videoIds || []).includes(v.id))
@@ -265,7 +318,7 @@ function runAd(box, ad, opt = {}) {
     <div class="ad-info">
       <div class="avatar sm">${esc((ad.advertiser || ad.title || 'إ').trim()[0] || 'إ')}</div>
       <div class="ad-text"><b>${esc(ad.title)}</b><small>${esc([ad.advertiser, ad.desc].filter(Boolean).join(' • '))}</small></div>
-      <span class="ad-cta">${esc(ad.cta || 'اعرف المزيد')}</span>
+      ${ad.noCta ? '' : `<span class="ad-cta">${esc(ad.cta || 'اعرف المزيد')}</span>`}
     </div>
     <div class="ad-prog"><i></i></div>`;
   el.addEventListener('click', e => e.stopPropagation());
@@ -480,7 +533,7 @@ async function renderYou() {
   let hist = [];
   try { hist = await reqP(store('history').getAll()); } catch (e) {}
   hist.sort((a, b) => b.ts - a.ts);
-  const items = hist.map(h => state.byId.get(h.videoId)).filter(Boolean).slice(0, 30);
+  const items = hist.map(h => state.byId.get(h.videoId)).filter(v => v && isVisible(v)).slice(0, 30);
   box.innerHTML = `
     <div class="you-head"><div class="avatar big">${svg('person')}</div><div><h2>أنت</h2><div class="w-meta">${esc(channel())}</div></div></div>
     <div class="sec-title"><h3>السجل</h3><span class="more">عرض الكل</span></div>
@@ -491,13 +544,13 @@ async function renderYou() {
 }
 
 /* ================= صفحة المشاهدة ================= */
-const W = { vid: $('#vid'), ov: $('#p-ov'), player: $('#player'), cur: null, url: null, hideT: null, skT: null, ad: null };
+const W = { vid: $('#vid'), ov: $('#p-ov'), player: $('#player'), cur: null, url: null, hideT: null, skT: null, ad: null, mini: false, skipPop: false };
 function killWatchAd() { if (W.ad) { W.ad.kill(); W.ad = null; } }
 let scrub = false;
 
 async function openWatch(id) {
-  const v = state.byId.get(id); if (!v) return;
-  const first = $('#watch').hidden;
+  const v = state.byId.get(id); if (!v || !isVisible(v)) return;
+  const first = $('#watch').hidden, wasMini = W.mini;
   killWatchAd();
   pauseShorts();
   let r;
@@ -506,7 +559,8 @@ async function openWatch(id) {
   W.url = r.obj ? r.url : null;
   W.cur = v;
   $('#watch').hidden = false;
-  if (first) history.pushState({ w: 1 }, '');
+  setMini(false);
+  if (first || wasMini) history.pushState({ w: 1 }, '');
   W.vid.src = r.url; W.vid.load();
   if (old) URL.revokeObjectURL(old);
   fillWatchInfo(v);
@@ -528,6 +582,7 @@ function cleanupWatch() {
   vid.pause(); vid.removeAttribute('src'); vid.load();
   if (W.url) { URL.revokeObjectURL(W.url); W.url = null; }
   W.cur = null;
+  setMini(false);
   $('#watch').hidden = true;
   clearTimeout(W.hideT);
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -537,8 +592,89 @@ function closeWatch() {
   cleanupWatch();
   if (history.state && history.state.w) history.back();
 }
+
+/* ---- المشغل المصغّر (مثل يوتيوب): ينزل تحت ويكمل شغل ---- */
+function setMini(on) {
+  if (on === !!W.mini) return;
+  W.mini = on;
+  const w = $('#watch');
+  w.classList.toggle('mini', on);
+  w.style.transform = ''; w.style.opacity = ''; w.style.transition = '';
+  document.body.classList.toggle('has-mini', on);
+  if (on) {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    if (W.cur) $('#mini-title').textContent = W.cur.title;
+  } else showCtl();
+  updPlay(); updProg();
+}
+function minimizeWatch() {
+  if ($('#watch').hidden || W.mini) return;
+  if (history.state && history.state.w) {
+    W.skipPop = true; setTimeout(() => { W.skipPop = false; }, 700);
+    history.back();
+  }
+  setMini(true);
+}
+function expandWatch() {
+  if (!W.mini) return;
+  history.pushState({ w: 1 }, '');
+  setMini(false);
+}
+// زر السهم / السحب للأسفل / زر الرجوع: يصغّر الفيديو. إذا كان إعلان يطلع نهائياً
+function exitPlayer() {
+  if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+  if (W.ad) { closeWatch(); return; }
+  minimizeWatch();
+}
+$('#mini-toggle').addEventListener('click', e => { e.stopPropagation(); togglePlay(); });
+$('#mini-close').addEventListener('click', e => { e.stopPropagation(); closeWatch(); });
+$('#watch').addEventListener('click', e => {
+  if (!W.mini || e.target.closest('#mini-toggle, #mini-close')) return;
+  expandWatch();
+});
+
+// سحب الإصبع للأسفل على المشغل أو على المعلومات (وهي بالأعلى) يصغّر الفيديو
+(function () {
+  const wEl = $('#watch');
+  let sw = null;
+  wEl.addEventListener('touchstart', e => {
+    sw = null;
+    if (W.mini || document.fullscreenElement || e.touches.length !== 1) return;
+    if (e.target.closest('.seek, .w-actions, .ad-skip')) return;
+    if (e.target.closest('.watch-info') && $('.watch-info').scrollTop > 0) return;
+    const t = e.touches[0];
+    sw = { x: t.clientX, y: t.clientY, dy: 0, on: false, t: Date.now() };
+  }, { passive: true });
+  wEl.addEventListener('touchmove', e => {
+    if (!sw) return;
+    const t = e.touches[0], dx = t.clientX - sw.x, dy = t.clientY - sw.y;
+    if (!sw.on) {
+      if (Math.abs(dy) < 8 && Math.abs(dx) < 8) return;
+      if (dy > 0 && Math.abs(dy) > Math.abs(dx) * 1.2) sw.on = true; else { sw = null; return; }
+    }
+    if (e.cancelable) e.preventDefault();
+    sw.dy = Math.max(0, dy);
+    wEl.style.transition = 'none';
+    wEl.style.transform = `translateY(${sw.dy * 0.9}px)`;
+    wEl.style.opacity = String(Math.max(0.4, 1 - sw.dy / 500));
+  }, { passive: false });
+  const end = () => {
+    if (!sw) return;
+    const s0 = sw; sw = null;
+    if (!s0.on) return;
+    if (s0.dy > 110 || (s0.dy > 60 && Date.now() - s0.t < 250)) { exitPlayer(); wEl.style.transform = ''; wEl.style.opacity = ''; wEl.style.transition = ''; }
+    else {
+      wEl.style.transition = 'transform .18s, opacity .18s';
+      wEl.style.transform = ''; wEl.style.opacity = '';
+      setTimeout(() => { wEl.style.transition = ''; }, 220);
+    }
+  };
+  wEl.addEventListener('touchend', end);
+  wEl.addEventListener('touchcancel', end);
+})();
 function fillWatchInfo(v) {
   $('#w-title').textContent = v.title;
+  $('#mini-title').textContent = v.title;
   $('#w-meta').textContent = [v.duration ? fmtDur(v.duration) : '', rel(v.created)].filter(Boolean).join(' • ');
   $('#w-av').textContent = chInitial();
   $('#w-chn').textContent = channel();
@@ -555,13 +691,15 @@ function showCtl() {
 }
 function updPlay() {
   const vid = W.vid;
-  $('#p-toggle').innerHTML = svg(vid.ended ? 'replay' : (vid.paused ? 'play' : 'pause'));
+  const ic = svg(vid.ended ? 'replay' : (vid.paused ? 'play' : 'pause'));
+  $('#p-toggle').innerHTML = ic; $('#mini-toggle').innerHTML = ic;
   if (!vid.paused) showCtl();
 }
 function updProg() {
   const vid = W.vid, d = isFinite(vid.duration) ? vid.duration : 0, f = d ? vid.currentTime / d : 0;
   $('#seek-fill').style.width = (f * 100) + '%';
   $('#seek-knob').style.left = (f * 100) + '%';
+  $('#mini-prog').style.width = (f * 100) + '%';
   $('#p-time').textContent = `${fmtDur(vid.currentTime)} / ${fmtDur(d)}`;
 }
 function spin(on) { $('#p-spin').hidden = !on; }
@@ -589,10 +727,7 @@ W.vid.addEventListener('waiting', () => spin(true));
 W.vid.addEventListener('error', () => { if (W.vid.getAttribute('src')) { spin(false); toast('تعذر تشغيل الفيديو'); } });
 
 $('#p-toggle').addEventListener('click', e => { e.stopPropagation(); togglePlay(); showCtl(); });
-$('#p-back').addEventListener('click', e => {
-  e.stopPropagation();
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else closeWatch();
-});
+$('#p-back').addEventListener('click', e => { e.stopPropagation(); exitPlayer(); });
 $('#p-full').addEventListener('click', e => {
   e.stopPropagation();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -653,6 +788,7 @@ function setTab(t, opt = {}) {
   if (prev === t && t === 'home' && opt.refresh !== false) {
     homeRank.clear(); renderHome(); $('#view-home').scrollTo({ top: 0, behavior: 'smooth' });
   }
+  if (t === 'shorts' && !$('#watch').hidden) closeWatch();
   state.tab = t;
   $$('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + t));
   $$('#bottomnav [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
@@ -691,14 +827,15 @@ document.addEventListener('click', e => {
 });
 
 window.addEventListener('popstate', () => {
-  if (!$('#watch').hidden) cleanupWatch();
+  if (W.skipPop) { W.skipPop = false; return; }
+  if (!$('#watch').hidden && !W.mini) { if (W.ad) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
   else if (!$('#admin').hidden) hideAdmin();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { W.vid.pause(); $$('.short video').forEach(v => v.pause()); if (W.ad) W.ad.pause(); }
   else {
     if (W.ad) W.ad.resume();
-    else if (state.tab === 'shorts' && activeShort && $('#watch').hidden) playShort(activeShort);
+    else if (state.tab === 'shorts' && activeShort && $('#watch').hidden && !kidAd) playShort(activeShort);
   }
 });
 
@@ -710,39 +847,60 @@ function refreshAll() {
 
 /* ================= فحص الفيديو + صورة مصغرة ================= */
 function probeVideo(src, opt) {
-  const o = Object.assign({ cors: false, thumb: true }, opt);
+  const o = Object.assign({ cors: false, thumb: true, max: 640, q: 0.82 }, opt);
   return new Promise(resolve => {
     const v = document.createElement('video');
     v.muted = true; v.playsInline = true; v.preload = 'auto';
+    v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
     if (o.cors) v.crossOrigin = 'anonymous';
     const out = { duration: 0, w: 0, h: 0, thumb: null };
-    let done = false, to;
+    let done = false, drawn = false, seeked = false, to, kick;
     const finish = () => {
-      if (done) return; done = true; clearTimeout(to);
-      v.onerror = v.onloadedmetadata = v.onseeked = null;
+      if (done) return; done = true; clearTimeout(to); clearTimeout(kick);
+      v.onerror = v.onloadedmetadata = v.onseeked = v.onloadeddata = v.onplaying = null;
       try { v.removeAttribute('src'); v.load(); } catch (e) {}
       resolve(out);
+    };
+    const draw = () => {
+      if (drawn || done) return; drawn = true;
+      try {
+        const sc = Math.min(1, o.max / Math.max(v.videoWidth, v.videoHeight));
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(v.videoWidth * sc));
+        c.height = Math.max(1, Math.round(v.videoHeight * sc));
+        c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+        c.toBlob(b => { out.thumb = b; finish(); }, 'image/jpeg', o.q);
+      } catch (e) { finish(); }
     };
     to = setTimeout(finish, 15000);
     v.onerror = finish;
     v.onloadedmetadata = () => {
       out.duration = isFinite(v.duration) ? v.duration : 0;
       out.w = v.videoWidth; out.h = v.videoHeight;
-      if (!o.thumb) return finish();
-      try { v.currentTime = Math.min(1, (v.duration || 2) * 0.1); } catch (e) { finish(); }
+      if (!o.thumb || !out.w) return finish();
+      try { v.currentTime = Math.min(1, (v.duration || 2) * 0.1); } catch (e) { return finish(); }
+      // بعض الهواتف (iOS) ما تحمّل اللقطة إلا إذا شغّلنا الفيديو صامت لحظة
+      kick = setTimeout(() => { if (!drawn) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } }, 1500);
     };
-    v.onseeked = () => {
-      try {
-        const sc = Math.min(1, 640 / Math.max(v.videoWidth, v.videoHeight));
-        const c = document.createElement('canvas');
-        c.width = Math.max(1, Math.round(v.videoWidth * sc));
-        c.height = Math.max(1, Math.round(v.videoHeight * sc));
-        c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-        c.toBlob(b => { out.thumb = b; finish(); }, 'image/jpeg', 0.82);
-      } catch (e) { finish(); }
-    };
+    v.onseeked = () => { seeked = true; if (v.readyState >= 2) draw(); };
+    v.onloadeddata = () => { if (seeked) draw(); };
+    v.onplaying = () => { draw(); };
     v.src = src;
   });
+}
+const blobToDataURL = b => new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(''); r.readAsDataURL(b); });
+// صورة مصغرة صغيرة تنحفظ بالسحابة (نص صغير بدل ملف)
+async function smallThumb(blob, max = 360) {
+  try {
+    const url = URL.createObjectURL(blob);
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+    URL.revokeObjectURL(url);
+    const sc = Math.min(1, max / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(img.width * sc)); c.height = Math.max(1, Math.round(img.height * sc));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', 0.7);
+  } catch (e) { return ''; }
 }
 async function downloadBlob(url, onProgress) {
   const res = await fetch(url, { mode: 'cors' });
@@ -772,7 +930,11 @@ function openAdmin() {
   history.pushState({ a: 1 }, '');
   buildAdmin();
 }
-function hideAdmin() { $('#admin').hidden = true; $('#admin').innerHTML = ''; }
+function hideAdmin() {
+  $('#admin').hidden = true; $('#admin').innerHTML = '';
+  if (seenRef) { seenRef.off(); seenRef = null; }
+  clearInterval(seenT);
+}
 function closeAdmin() {
   if ($('#admin').hidden) return;
   hideAdmin();
@@ -787,12 +949,14 @@ function buildAdmin() {
   el.innerHTML = `
   <div class="adm-head"><button class="icon-btn" id="adm-close" aria-label="إغلاق" data-ico="close"></button><h2>الإدارة</h2></div>
   <div class="adm-body">
+    <section class="adm-card" id="adm-ctl"></section>
     <section class="adm-card">
       <h3>إضافة فيديو</h3>
       <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button></div>
       <div id="src-file"><label class="filebtn"><input type="file" id="in-file" accept="video/*" hidden><span id="in-file-name">اختر فيديو</span></label></div>
       <div id="src-url" hidden>
         <input id="in-url" type="url" dir="ltr" placeholder="https://..." autocomplete="off">
+        <label class="chk" id="in-cloud-row"><input type="checkbox" id="in-cloud"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>
         <label class="chk"><input type="checkbox" id="in-offline"><span>حفظ على الهاتف (يشتغل بدون إنترنت)</span></label>
       </div>
       <input id="in-title" type="text" placeholder="العنوان" autocomplete="off">
@@ -818,13 +982,16 @@ function buildAdmin() {
   </div>`;
   injectIcons(el);
   renderAdminList();
-  buildAdsAdmin(); renderAdsList();
+  buildAdsAdmin(); renderAdsList(); buildCtl();
 
   $('#adm-close').onclick = closeAdmin;
   const seg = (id, cb) => $(id).addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     setSeg(id, b.dataset.v); cb(b.dataset.v);
   });
+  $('#in-cloud-row').hidden = !CL.ok;
+  $('#in-cloud').onchange = e => { if (e.target.checked) $('#in-offline').checked = false; };
+  $('#in-offline').onchange = e => { if (e.target.checked) $('#in-cloud').checked = false; };
   seg('#seg-src', v => { adm.src = v; $('#src-file').hidden = v !== 'file'; $('#src-url').hidden = v !== 'url'; });
   seg('#seg-kind', v => { adm.kind = v; adm.kindTouched = true; });
 
@@ -868,14 +1035,15 @@ let adf = {};
 function buildAdsAdmin() {
   adf = { src: 'file', file: null, skip: 5, target: 'all', perHour: 2, busy: false };
   const box = $('#adm-adsform'); if (!box) return;
-  const vids = state.videos.length
-    ? state.videos.map(v => `<label class="chk"><input type="checkbox" value="${v.id}"><span>${esc(v.title)}${v.duration > 60 ? '' : ' — (دقيقة أو أقل، ما يطلع عليه إعلان)'}</span></label>`).join('')
+  const vids = state.all.length
+    ? state.all.map(v => `<label class="chk"><input type="checkbox" value="${v.id}"><span>${esc(v.title)}</span></label>`).join('')
     : '<div class="muted">ما أضفت فيديوهات بعد</div>';
   box.innerHTML = `<h3>إضافة إعلان</h3>
-    <div class="lbl">الإعلان يطلع قبل الفيديو، وبس إذا الفيديو أطول من دقيقة</div>
+    <div class="lbl">الإعلان يطلع قبل الفيديو (حتى لو الفيديو أقل من دقيقة)</div>
     <div class="seg" id="seg-ad-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button></div>
     <div id="ad-src-file"><label class="filebtn"><input type="file" id="ad-file" accept="video/*" hidden><span id="ad-file-name">اختر فيديو الإعلان</span></label></div>
-    <div id="ad-src-url" hidden><input id="ad-url" type="url" dir="ltr" placeholder="https://..." autocomplete="off"></div>
+    <div id="ad-src-url" hidden><input id="ad-url" type="url" dir="ltr" placeholder="https://..." autocomplete="off">
+      ${CL.ok ? '<label class="chk"><input type="checkbox" id="ad-cloud"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>' : ''}</div>
     <input id="ad-title" type="text" placeholder="اسم الإعلان" autocomplete="off">
     <input id="ad-adv" type="text" placeholder="اسم المعلن (مثلاً: وقت النوم)" autocomplete="off">
     <input id="ad-desc" type="text" placeholder="تفاصيل قصيرة تظهر مع الإعلان" autocomplete="off">
@@ -930,11 +1098,15 @@ async function onAddAd() {
       useTime: $('#ad-usetime').checked, from: $('#ad-from').value || '20:00', to: $('#ad-to').value || '23:00',
       perHour: adf.perHour, enabled: true, created: Date.now()
     };
-    const tx = db.transaction(['ads', 'blobs'], 'readwrite');
-    tx.objectStore('ads').put(ad);
-    if (isFile) tx.objectStore('blobs').put(adf.file, 'ad:' + ad.id + ':video');
-    await txDone(tx);
-    await loadAds();
+    if (!isFile && CL.ok && $('#ad-cloud') && $('#ad-cloud').checked) {
+      await withTimeout(CL.db.ref('ads/' + ad.id).set(ad));
+    } else {
+      const tx = db.transaction(['ads', 'blobs'], 'readwrite');
+      tx.objectStore('ads').put(ad);
+      if (isFile) tx.objectStore('blobs').put(adf.file, 'ad:' + ad.id + ':video');
+      await txDone(tx);
+      await loadAds();
+    }
     buildAdsAdmin(); renderAdsList();
     toast('تمت إضافة الإعلان ✓');
   } catch (e) {
@@ -958,7 +1130,7 @@ function renderAdsList() {
   box.innerHTML = `<h3>الإعلانات (${state.ads.length})</h3>` + (state.ads.length ? state.ads.map(a => `
     <div class="adrow${a.enabled === false ? ' off' : ''}" data-ad="${a.id}">
       <b>${esc(a.title)}</b>
-      <small>${esc(adSummary(a))}${a.hasBlob ? ' • على الهاتف ' + fmtSize(a.size) : ' • رابط'}</small>
+      <small>${esc(adSummary(a))}${a.hasBlob ? ' • على الهاتف ' + fmtSize(a.size) : (a.cloud ? ' • سحابة' : ' • رابط')}</small>
       <div class="adact">
         <button class="ghost" data-a="prev">معاينة</button>
         <button class="ghost" data-a="tog">${a.enabled === false ? 'تشغيل' : 'إيقاف'}</button>
@@ -969,15 +1141,21 @@ function renderAdsList() {
     const a = state.ads.find(x => x.id === row.dataset.ad); if (!a) return;
     $('[data-a="prev"]', row).onclick = () => previewAd(a);
     $('[data-a="tog"]', row).onclick = async () => {
-      try { await reqP(store('ads', 'readwrite').put(Object.assign({}, a, { enabled: a.enabled === false }))); await loadAds(); renderAdsList(); }
+      try {
+        if (a.cloud) await withTimeout(CL.db.ref('ads/' + a.id + '/enabled').set(a.enabled === false));
+        else { await reqP(store('ads', 'readwrite').put(Object.assign({}, a, { enabled: a.enabled === false }))); await loadAds(); renderAdsList(); }
+      }
       catch (e) { toast('تعذر التعديل'); }
     };
     $('[data-a="del"]', row).onclick = async () => {
       if (!confirm(`حذف الإعلان "${a.title}"؟`)) return;
       try {
-        const tx = db.transaction(['ads', 'blobs'], 'readwrite');
-        tx.objectStore('ads').delete(a.id); tx.objectStore('blobs').delete('ad:' + a.id + ':video');
-        await txDone(tx); await loadAds(); renderAdsList(); toast('تم الحذف');
+        if (a.cloud) { await withTimeout(CL.db.ref('ads/' + a.id).remove()); toast('تم الحذف'); }
+        else {
+          const tx = db.transaction(['ads', 'blobs'], 'readwrite');
+          tx.objectStore('ads').delete(a.id); tx.objectStore('blobs').delete('ad:' + a.id + ':video');
+          await txDone(tx); await loadAds(); renderAdsList(); toast('تم الحذف');
+        }
       } catch (e) { toast('تعذر الحذف'); }
     };
   });
@@ -994,19 +1172,23 @@ function previewAd(a) {
 
 function renderAdminList() {
   const box = $('#adm-list'); if (!box) return;
-  $('#adm-count').textContent = `الفيديوهات (${state.videos.length})`;
-  if (!state.videos.length) { box.innerHTML = '<div class="muted">ما أضفت أي فيديو بعد</div>'; return; }
-  box.innerHTML = state.videos.map(v => `
+  $('#adm-count').textContent = `الفيديوهات (${state.all.length})`;
+  if (!state.all.length) { box.innerHTML = '<div class="muted">ما أضفت أي فيديو بعد</div>'; return; }
+  box.innerHTML = state.all.map(v => `
     <div class="arow" data-id="${v.id}">
       <div class="at${v.kind === 'short' ? ' vert' : ''}"><img alt="" data-vid="${v.id}"></div>
-      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) : ' • رابط'}</small></div>
+      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) : (v.cloud ? ' • سحابة' : ' • رابط')}</small></div>
       <button class="icon-btn danger" data-del="${v.id}" aria-label="حذف">${svg('trash')}</button>
     </div>`).join('');
   fillThumbs(box);
   $$('[data-del]', box).forEach(b => b.onclick = async () => {
     const v = state.byId.get(b.dataset.del); if (!v) return;
     if (!confirm(`حذف "${v.title}"؟`)) return;
-    try { await deleteVideo(v.id); await loadVideos(); refreshAll(); renderAdminList(); renderAdsList(); toast('تم الحذف'); }
+    try {
+      if (v.cloud) await withTimeout(CL.db.ref('videos/' + v.id).remove());
+      else { await deleteVideo(v.id); await loadVideos(); }
+      refreshAll(); renderAdminList(); renderAdsList(); toast('تم الحذف');
+    }
     catch (e) { toast('تعذر الحذف'); }
   });
 }
@@ -1028,6 +1210,7 @@ async function onAdd() {
 
 async function doAdd(isFile, url) {
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  const toCloud = !isFile && CL.ok && $('#in-cloud') && $('#in-cloud').checked;
   const meta = {
     id: uid(), title: $('#in-title').value.trim() || 'بدون عنوان', kind: adm.kind,
     src: isFile ? 'file' : 'url', url: isFile ? '' : url, hasBlob: false,
@@ -1040,27 +1223,33 @@ async function doAdd(isFile, url) {
     probe = await adm.probing; if (!probe) probe = adm.probe;
     blobs.video = adm.file; meta.hasBlob = true; meta.size = adm.file.size;
   } else {
-    if ($('#in-offline').checked) {
+    if (!toCloud && $('#in-offline').checked) {
       try { const b = await downloadBlob(url, setStatus); blobs.video = b; meta.hasBlob = true; meta.size = b.size; }
       catch (e) { toast('ما كدرت أحمّل الفيديو على الهاتف، راح يشتغل بالإنترنت فقط'); }
     }
     setStatus('جاري فحص الفيديو…');
     if (meta.hasBlob) { const u = URL.createObjectURL(blobs.video); probe = await probeVideo(u); URL.revokeObjectURL(u); }
     else {
-      probe = await probeVideo(url, { cors: true });
+      probe = await probeVideo(url, { cors: true, max: toCloud ? 360 : 640, q: toCloud ? 0.7 : 0.82 });
       if (!probe.duration) probe = await probeVideo(url, { thumb: false });
     }
     if (probe && probe.w && probe.h && !adm.kindTouched) meta.kind = probe.h > probe.w ? 'short' : 'long';
   }
   if (probe) meta.duration = probe.duration || 0;
   const thumbUrl = $('#in-thumburl').value.trim();
-  if (adm.thumbFile) { blobs.thumb = adm.thumbFile; meta.hasThumb = true; }
+  if (adm.thumbFile) {
+    if (toCloud) meta.thumbUrl = await smallThumb(adm.thumbFile);
+    else { blobs.thumb = adm.thumbFile; meta.hasThumb = true; }
+  }
   else if (/^https?:\/\//i.test(thumbUrl)) meta.thumbUrl = thumbUrl;
-  else if (probe && probe.thumb) { blobs.thumb = probe.thumb; meta.hasThumb = true; }
+  else if (probe && probe.thumb) {
+    if (toCloud) meta.thumbUrl = await smallThumb(probe.thumb);
+    else { blobs.thumb = probe.thumb; meta.hasThumb = true; }
+  }
 
   setStatus('جاري الحفظ…');
-  await saveVideo(meta, blobs);
-  await loadVideos();
+  if (toCloud) await withTimeout(CL.db.ref('videos/' + meta.id).set(meta));
+  else { await saveVideo(meta, blobs); await loadVideos(); }
   refreshAll();
   buildAdmin();
   toast('تمت الإضافة ✓');
@@ -1091,15 +1280,202 @@ function askCode() {
   m.onclick = e => { if (e.target === m) close(); };
 }
 
+/* ================= السحابة + التحكم عن بعد ================= */
+let seenRef = null, seenT = null, seenTs = 0, beatT = null, kidAd = null, cloudWarned = false;
+
+function sigIds() { return state.videos.map(v => v.id).join(','); }
+function syncVideos() {
+  const before = sigIds();
+  rebuildVideos();
+  if (before !== sigIds()) {
+    refreshAll(); renderAdminList();
+    if (W.cur && !isVisible(W.cur)) closeWatch();
+  }
+}
+function cloudErr() { if (!cloudWarned) { cloudWarned = true; toast('تعذر الاتصال بالسحابة، تحقق من Rules بالـ Firebase'); } }
+
+function startCloud() {
+  if (!CL.ok) return;
+  CL.db.ref('videos').on('value', snap => {
+    const o = snap.val() || {};
+    state.cloud = Object.keys(o).map(k => o[k]).filter(v => v && v.id && v.url);
+    LS.set('cv', JSON.stringify(state.cloud));
+    syncVideos(); renderAdminList(); if (typeof refreshCtlLists === 'function') refreshCtlLists();
+  }, cloudErr);
+  CL.db.ref('ads').on('value', snap => {
+    const o = snap.val() || {};
+    state.cloudAds = Object.keys(o).map(k => Object.assign({}, o[k], { cloud: true, hasBlob: false, videoIds: o[k].videoIds || [] }));
+    LS.set('ca', JSON.stringify(state.cloudAds));
+    rebuildAds(); renderAdsList(); if (typeof refreshCtlLists === 'function') refreshCtlLists();
+  }, cloudErr);
+  CL.db.ref('control/kid').on('value', snap => {
+    state.ctl = snap.val() || {};
+    LS.set('cc', JSON.stringify(state.ctl));
+    applyCtl(); onCtlUpdate();
+  }, cloudErr);
+  startBeat();
+}
+
+function startBeat() {
+  stopBeat();
+  if (!CL.ok || !KID()) return;
+  const b = () => { try { CL.db.ref('control/kidSeen').set(CL.ts); } catch (e) {} };
+  b(); beatT = setInterval(b, 20000);
+}
+function stopBeat() { clearInterval(beatT); beatT = null; }
+
+// تطبيق أوامر الأب على جهاز الطفل
+function applyCtl() {
+  syncVideos();
+  const locked = KID() && state.ctl.mode === 'locked';
+  $('#lock').hidden = !locked;
+  if (locked) { closeWatch(); pauseShorts(); killKidAd(); return; }
+  handlePush();
+}
+function handlePush() {
+  const p = state.ctl && state.ctl.push;
+  if (!KID() || !p || !p.id || !p.url || p.id === LS.get('lastpush', '')) return;
+  if (p.ts && (CL.now() - p.ts) / 1000 > 180) return; // أمر قديم، لا نعرضه
+  LS.set('lastpush', p.id);
+  showKidAd(p);
+}
+function killKidAd() { if (kidAd) { kidAd.kill(); if (kidAd._box) kidAd._box.remove(); kidAd = null; } }
+// الإعلان ينبثق فوق كل شيء، والفيديو اللي يشوفه الطفل يتوقف لحد ما يخلص أو يتخطى
+function showKidAd(p) {
+  killKidAd();
+  const box = document.createElement('div'); box.id = 'kidad'; document.body.appendChild(box);
+  const watching = !$('#watch').hidden && !W.vid.paused;
+  const sv = state.tab === 'shorts' && activeShort ? $('video', activeShort) : null;
+  const shortPlaying = !!(sv && !sv.paused);
+  const siteAd = W.ad;
+  W.vid.pause(); $$('.short video').forEach(v => v.pause());
+  if (siteAd) siteAd.pause();
+  const ad = { id: 'push-' + p.id, title: p.title || 'إعلان', advertiser: p.advertiser || '', desc: p.desc || '', url: p.url, skip: +p.skip || 0, noCta: true };
+  const ctl = runAd(box, ad, {
+    preview: true, muted: false,
+    onEnd: () => {
+      box.remove(); if (kidAd === ctl) kidAd = null;
+      if (siteAd && W.ad === siteAd) siteAd.resume();
+      else if (watching && W.cur) W.vid.play().catch(() => {});
+      if (shortPlaying && sv) sv.play().catch(() => {});
+    }
+  });
+  ctl._box = box; kidAd = ctl;
+}
+
+/* ---- لوحة تحكم الأب ---- */
+function updCtlStatus() {
+  const el = $('#ctl-seen'); if (!el) return;
+  if (!seenTs) { el.textContent = 'جهاز الطفل: ما اتصل بعد (فعّل «هذا جهاز الطفل» على جهازه)'; return; }
+  const local = seenTs - (CL.offset || 0);
+  el.textContent = Date.now() - local < 60000 ? '🟢 جهاز الطفل متصل الآن' : '⚪ آخر ظهور لجهاز الطفل: ' + rel(local);
+}
+function cloudOptions() {
+  const vids = state.cloud.slice().sort((a, b) => b.created - a.created);
+  const ads = state.cloudAds;
+  return vids.map(v => `<option value="v:${esc(v.id)}">${esc(v.title)}</option>`).join('')
+    + ads.map(a => `<option value="a:${esc(a.id)}">إعلان: ${esc(a.title)}</option>`).join('');
+}
+function refreshCtlLists() {
+  const sel = $('#ctl-vid'), only = $('#ctl-only');
+  if (sel) { const cur = sel.value; sel.innerHTML = cloudOptions(); if (cur) sel.value = cur; }
+  if (only) {
+    const al = (state.ctl && state.ctl.allowed) || {};
+    only.innerHTML = state.cloud.length
+      ? state.cloud.slice().sort((a, b) => b.created - a.created).map(v => `<label class="chk"><input type="checkbox" value="${esc(v.id)}"${al[v.id] ? ' checked' : ''}><span>${esc(v.title)}</span></label>`).join('')
+      : '<div class="muted">أضف فيديوهات «بالسحابة» أولاً حتى تختارها</div>';
+  }
+}
+function onCtlUpdate() {
+  if (!$('#adm-ctl') || !$('#seg-mode')) return;
+  const mode = state.ctl.mode || 'all';
+  setSeg('#seg-mode', mode);
+  $('#ctl-only').hidden = mode !== 'only';
+  refreshCtlLists();
+}
+function buildCtl() {
+  const box = $('#adm-ctl'); if (!box) return;
+  if (!CL.ok) {
+    box.innerHTML = '<h3>التحكم بجهاز الطفل</h3><div class="muted">السحابة غير متصلة. تحتاج إنترنت حتى تشتغل هذه الميزة.</div>';
+    return;
+  }
+  const mode = state.ctl.mode || 'all';
+  box.innerHTML = `<h3>التحكم بجهاز الطفل</h3>
+    <div id="ctl-seen"></div>
+    <div class="lbl">شنو يشوف الطفل؟</div>
+    <div class="seg" id="seg-mode"><button data-v="all">كل المحتوى</button><button data-v="only">محتوى محدد</button><button data-v="locked">إيقاف الموقع</button></div>
+    <div id="ctl-only" class="vidpick" hidden></div>
+    <div class="lbl">إرسال فيديو كإعلان للطفل الآن</div>
+    <select id="ctl-vid">${cloudOptions()}</select>
+    <input id="ctl-title" type="text" placeholder="عنوان يظهر مع الإعلان (اختياري)" autocomplete="off">
+    <div class="lbl">زر التخطي</div>
+    <div class="seg" id="seg-push-skip"><button data-v="5">بعد 5 ث</button><button class="on" data-v="10">بعد 10 ث</button><button data-v="15">بعد 15 ث</button><button data-v="0">بدون تخطي</button></div>
+    <button class="primary" id="ctl-send">أرسل الآن</button>
+    <label class="chk"><input type="checkbox" id="ctl-iskid"><span>هذا الجهاز هو جهاز الطفل</span></label>`;
+  setSeg('#seg-mode', mode);
+  $('#ctl-only').hidden = mode !== 'only';
+  refreshCtlLists();
+  $('#ctl-iskid').checked = KID();
+  let skip = 10;
+  $('#seg-mode').addEventListener('click', async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    setSeg('#seg-mode', b.dataset.v); $('#ctl-only').hidden = b.dataset.v !== 'only';
+    try { await withTimeout(CL.db.ref('control/kid/mode').set(b.dataset.v)); toast('تم'); } catch (x) { toast('تعذر الإرسال'); }
+  });
+  $('#ctl-only').addEventListener('change', async () => {
+    const m = {};
+    $$('#ctl-only input:checked').forEach(i => { m[i.value] = true; });
+    try { await withTimeout(CL.db.ref('control/kid/allowed').set(Object.keys(m).length ? m : null)); } catch (x) { toast('تعذر الحفظ'); }
+  });
+  $('#seg-push-skip').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    setSeg('#seg-push-skip', b.dataset.v); skip = +b.dataset.v;
+  });
+  $('#ctl-send').onclick = async () => {
+    const val = $('#ctl-vid').value;
+    if (!val) return toast('اختر فيديو من السحابة أولاً');
+    const item = val[0] === 'v' ? state.cloud.find(x => x.id === val.slice(2)) : state.cloudAds.find(x => x.id === val.slice(2));
+    if (!item) return toast('الفيديو غير موجود');
+    const title = $('#ctl-title').value.trim() || item.title || 'إعلان';
+    try {
+      await withTimeout(CL.db.ref('control/kid/push').set({ id: uid(), url: item.url, title, skip, ts: CL.ts }));
+      toast('تم الإرسال لجهاز الطفل ✓');
+    } catch (x) { toast('تعذر الإرسال'); }
+  };
+  $('#ctl-iskid').onchange = e => {
+    LS.set('kid', e.target.checked ? '1' : '0');
+    if (e.target.checked) startBeat(); else stopBeat();
+    applyCtl(); refreshAll();
+    toast(e.target.checked ? 'هذا الجهاز صار جهاز الطفل' : 'رجع جهاز عادي');
+  };
+  // حالة الاتصال
+  if (seenRef) seenRef.off();
+  seenRef = CL.db.ref('control/kidSeen');
+  seenRef.on('value', s => { seenTs = s.val() || 0; updCtlStatus(); });
+  clearInterval(seenT); seenT = setInterval(updCtlStatus, 5000);
+  updCtlStatus();
+}
+
+// ضغطة مطولة على شعار شاشة الإيقاف تفتح الرمز السري
+(function () {
+  const lg = $('#lock-logo'); let t = null;
+  lg.addEventListener('pointerdown', () => { clearTimeout(t); t = setTimeout(askCode, 1500); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => lg.addEventListener(ev, () => clearTimeout(t)));
+})();
+
 /* ================= التشغيل ================= */
 async function init() {
   injectIcons();
   setMuteIcon();
   try { db = await openDB(); }
   catch (e) { $('#home-list').innerHTML = '<div class="empty">تعذر فتح التخزين</div>'; return; }
+  state.cloud = lsJSON('cv', []); state.cloudAds = lsJSON('ca', []); state.ctl = lsJSON('cc', {});
   await loadVideos();
   await loadAds();
+  $('#lock').hidden = !(KID() && state.ctl.mode === 'locked');
   renderHome(); navIcons('home');
+  startCloud();
+  ensureThumbs();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 init();
