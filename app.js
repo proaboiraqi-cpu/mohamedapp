@@ -440,7 +440,7 @@ async function startShort(s) {
   vd.muted = state.muted;
   try { await vd.play(); }
   catch (e) {
-    if (!state.muted) { state.muted = true; setMuteIcon(); vd.muted = true; try { await vd.play(); } catch (e2) {} }
+    if (!state.muted) { state.muted = true; vd.muted = true; try { await vd.play(); } catch (e2) {} }
   }
   clearTimeout(s._ht);
   s._ht = setTimeout(() => { if (activeShort === s) addHistory(s.dataset.id); }, 1500);
@@ -533,6 +533,7 @@ feed.addEventListener('timeupdate', e => {
 }, true);
 feed.addEventListener('loadedmetadata', e => {
   const vd = e.target;
+  if (vd.tagName === 'VIDEO') fixDur(vd);
   if (vd.closest && vd.closest('.ad')) return;
   if (vd.videoWidth && vd.videoHeight) vd.classList.toggle('cover', vd.videoWidth / vd.videoHeight < 0.7);
 }, true);
@@ -543,14 +544,16 @@ feed.addEventListener('click', e => {
   if (e.target.closest('button')) return;
   const s = e.target.closest('.short'); if (!s) return;
   const vd = $('video', s), fl = $('.s-flash', s);
+  // إذا المتصفح شغّله بدون صوت، أول ضغطة ترجع الصوت بدل الإيقاف
+  if (state.muted || vd.muted) {
+    state.muted = false; vd.muted = false;
+    if (vd.paused) vd.play().catch(() => {});
+    fl.innerHTML = svg('volume'); fl.classList.remove('go'); void fl.offsetWidth; fl.classList.add('go');
+    return;
+  }
   if (vd.paused) { vd.play().catch(() => {}); fl.innerHTML = svg('play'); }
   else { vd.pause(); fl.innerHTML = svg('pause'); }
   fl.classList.remove('go'); void fl.offsetWidth; fl.classList.add('go');
-});
-function setMuteIcon() { $('#short-mute').innerHTML = svg(state.muted ? 'mute' : 'volume'); }
-$('#short-mute').addEventListener('click', () => {
-  state.muted = !state.muted; setMuteIcon();
-  if (activeShort) $('video', activeShort).muted = state.muted;
 });
 function goShort(id) { setTab('shorts', { first: id }); }
 // زر الرجوع (بالأعلى يمين): يطلع من Shorts للرئيسية
@@ -758,7 +761,8 @@ function togglePlay() {
 
 ['play', 'pause', 'ended'].forEach(ev => W.vid.addEventListener(ev, updPlay));
 W.vid.addEventListener('timeupdate', updProg);
-W.vid.addEventListener('loadedmetadata', updProg);
+W.vid.addEventListener('loadedmetadata', () => { fixDur(W.vid); updProg(); });
+W.vid.addEventListener('durationchange', updProg);
 W.vid.addEventListener('waiting', () => spin(true));
 ['playing', 'canplay', 'pause', 'ended'].forEach(ev => W.vid.addEventListener(ev, () => spin(false)));
 W.vid.addEventListener('error', () => { if (W.vid.getAttribute('src')) { spin(false); toast('تعذر تشغيل الفيديو'); } });
@@ -926,7 +930,7 @@ function probeVideo(src, opt) {
       out.duration = isFinite(v.duration) ? v.duration : 0;
       out.w = v.videoWidth; out.h = v.videoHeight;
       if (!o.thumb || !out.w) return finish();
-      try { v.currentTime = Math.min(1, (v.duration || 2) * 0.1); } catch (e) { return finish(); }
+      try { v.currentTime = o.at ? Math.min(30, (isFinite(v.duration) ? v.duration : 2) * o.at) : Math.min(1, (v.duration || 2) * 0.1); } catch (e) { return finish(); }
       // بعض الهواتف (iOS) ما تحمّل اللقطة إلا إذا شغّلنا الفيديو صامت لحظة
       kick = setTimeout(() => { if (!drawn) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } }, 1500);
     };
@@ -950,6 +954,142 @@ async function smallThumb(blob, max = 320) {
     return c.toDataURL('image/jpeg', 0.65);
   } catch (e) { return ''; }
 }
+// الفيديو المضغوط أحياناً يطلع بدون مدة (Infinity) فما يشتغل شريط التقديم. هاي تصلحها
+function fixDur(vd) {
+  if (vd.duration !== Infinity || vd._fixing) return;
+  vd._fixing = true;
+  const t0 = vd.currentTime || 0;
+  const end = () => {
+    if (vd.duration === Infinity) return;
+    vd.removeEventListener('durationchange', end); clearTimeout(g); vd._fixing = false;
+    try { vd.currentTime = t0; } catch (e) {}
+  };
+  const g = setTimeout(() => { vd.removeEventListener('durationchange', end); vd._fixing = false; }, 5000);
+  vd.addEventListener('durationchange', end);
+  try { vd.currentTime = 1e101; } catch (e) { end(); }
+}
+
+/* ================= ضغط الفيديو (أقوى ضغط) ================= */
+// يعيد ترميز الفيديو على الهاتف نفسه: دقة 640 كحد أقصى، 24 إطار، 180 كيلوبت للصورة و32 للصوت
+const CMP = { maxSide: 640, fps: 24, vbps: 180000, abps: 32000 };
+function pickRecMime() {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
+  const list = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4',
+    'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  return list.find(t => { try { return MediaRecorder.isTypeSupported(t); } catch (e) { return false; } }) || '';
+}
+const canCompress = () => !!(pickRecMime() && HTMLCanvasElement.prototype.captureStream && (window.AudioContext || window.webkitAudioContext));
+// جلسة ضغط: تنفتح مرة وحدة من ضغطة الزر (حتى يسمح الهاتف بالصوت) وتنعاد لكل الفيديوهات
+function makeCompressor() {
+  const mime = pickRecMime();
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const cv = document.createElement('canvas');
+  if (!mime || !cv.captureStream || !AC) return null;
+  const v = document.createElement('video');
+  v.playsInline = true; v.preload = 'auto';
+  v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
+  v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none;z-index:-1';
+  document.body.appendChild(v);
+  let ac = null, srcNode = null, wake = null, closed = false, cur = null;
+  try { ac = new AC(); srcNode = ac.createMediaElementSource(v); if (ac.resume) ac.resume().catch(() => {}); }
+  catch (e) { v.remove(); return null; }
+  const getWake = async () => { try { if (navigator.wakeLock && !wake && !closed) { wake = await navigator.wakeLock.request('screen'); wake.onrelease = () => { wake = null; }; } } catch (e) {} };
+  const onVis = () => {
+    if (!cur || cur.done) return;
+    try {
+      if (document.hidden) { if (cur.rec && cur.rec.state === 'recording') cur.rec.pause(); }
+      else { if (cur.rec && cur.rec.state === 'paused') cur.rec.resume(); v.play().catch(() => {}); getWake(); }
+    } catch (e) {}
+  };
+  document.addEventListener('visibilitychange', onVis);
+
+  function run(file, onProgress) {
+    const job = { done: false, aborted: false, rec: null, tracks: [], wait: null, timer: 0, url: URL.createObjectURL(file), dest: null };
+    cur = job;
+    v.src = job.url;
+    if (ac.state === 'suspended') ac.resume().catch(() => {});
+    // تشغيل لحظي حتى يتفتح التشغيل بالصوت (الصوت يروح للتسجيل مو للسماعة)
+    const unlock = v.play().then(() => { v.pause(); return true; }, () => false);
+    const cleanup = () => {
+      job.done = true; clearTimeout(job.timer);
+      job.tracks.forEach(t => { try { t.stop(); } catch (e) {} });
+      try { if (job.dest) srcNode.disconnect(job.dest); } catch (e) {}
+      v.onended = v.onerror = v.onpause = v.onseeked = v.onloadedmetadata = null;
+      try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+      URL.revokeObjectURL(job.url);
+      if (cur === job) cur = null;
+    };
+    job.abort = () => { job.aborted = true; if (job.wait) job.wait(); };
+    const p = (async () => {
+      try {
+        if (!(await unlock)) throw new Error('play blocked');
+        if (v.readyState < 1) await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = rej; setTimeout(rej, 15000); });
+        const W0 = v.videoWidth, H0 = v.videoHeight, dur = v.duration;
+        if (!W0 || !H0 || !isFinite(dur) || !dur) throw new Error('bad video');
+        const sc = Math.min(1, CMP.maxSide / Math.max(W0, H0));
+        cv.width = Math.max(2, Math.round(W0 * sc / 2) * 2);
+        cv.height = Math.max(2, Math.round(H0 * sc / 2) * 2);
+        const ctx = cv.getContext('2d');
+        job.dest = ac.createMediaStreamDestination();
+        srcNode.connect(job.dest);
+        job.tracks = cv.captureStream(CMP.fps).getVideoTracks().concat(job.dest.stream.getAudioTracks());
+        await getWake();
+        if (v.currentTime > 0) { v.currentTime = 0; await new Promise(r => { v.onseeked = r; setTimeout(r, 3000); }); }
+        ctx.drawImage(v, 0, 0, cv.width, cv.height);
+        const rec = job.rec = new MediaRecorder(new MediaStream(job.tracks), { mimeType: mime, videoBitsPerSecond: CMP.vbps, audioBitsPerSecond: CMP.abps });
+        const chunks = [];
+        rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+        const stopped = new Promise(r => { rec.onstop = r; });
+        const draw = () => {
+          if (job.done) return;
+          ctx.drawImage(v, 0, 0, cv.width, cv.height);
+          onProgress && onProgress(Math.min(1, v.currentTime / dur));
+          if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(draw); else requestAnimationFrame(draw);
+        };
+        rec.start(1000);
+        await v.play();
+        draw();
+        await new Promise(res => {
+          job.wait = res;
+          v.onended = res; v.onerror = res;
+          v.onpause = () => { if (!job.done && !v.ended && !document.hidden) setTimeout(() => { if (!job.done && !v.ended && !job.aborted) v.play().catch(() => {}); }, 300); };
+          job.timer = setTimeout(res, dur * 2500 + 30000);
+        });
+        v.onpause = null;
+        try { rec.requestData(); } catch (e) {}
+        if (rec.state !== 'inactive') rec.stop();
+        await stopped;
+        cleanup();
+        if (job.aborted) return null;
+        const out = new Blob(chunks, { type: mime.split(';')[0] });
+        return out.size > 1000 ? out : null;
+      } catch (e) {
+        console.warn('compress failed', e);
+        try { if (job.rec && job.rec.state !== 'inactive') job.rec.stop(); } catch (x) {}
+        cleanup();
+        return null;
+      }
+    })();
+    p.abort = job.abort;
+    return p;
+  }
+  function close() {
+    closed = true;
+    document.removeEventListener('visibilitychange', onVis);
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+    v.remove();
+    if (ac) ac.close().catch(() => {});
+    if (wake) wake.release().catch(() => {});
+  }
+  return { run, close };
+}
+// لازم تنستدعى مباشرة من ضغطة الزر (قبل أي await)
+function compressVideo(file, onProgress) {
+  const c = makeCompressor();
+  if (!c) return Promise.resolve(null);
+  return c.run(file, onProgress).finally(() => c.close());
+}
+
 async function downloadBlob(url, onProgress) {
   const res = await fetch(url, { mode: 'cors' });
   if (!res.ok) throw new Error('http ' + res.status);
@@ -998,6 +1138,20 @@ function buildAdmin() {
   <div class="adm-head"><button class="icon-btn" id="adm-close" aria-label="إغلاق" data-ico="close"></button><h2>الإدارة</h2></div>
   <div class="adm-body">
     <section class="adm-card" id="adm-ctl"></section>
+    <section class="adm-card" id="adm-batch">
+      <h3>إضافة مجموعة فيديوهات (تلقائي)</h3>
+      <div class="lbl">اختر الفيديوهات كلها مرة وحدة، والباقي ينسوي لحاله: ضغط، عنوان، صورة مصغرة، وحفظ على الهاتف. الفيديو دقيقة أو أقل يصير Short، وغيره فيديو طويل.</div>
+      <label class="filebtn"><input type="file" id="bt-files" accept="video/*" multiple hidden><span id="bt-name">اختر الفيديوهات</span></label>
+      <label class="chk" id="bt-cmp-row"><input type="checkbox" id="bt-cmp" checked><span>ضغط بأقوى درجة</span></label>
+      <button class="primary" id="bt-go">ضغط ونشر</button>
+      <div class="cmp" id="bt-prog" hidden>
+        <div id="bt-line1"></div>
+        <div class="cmp-bar" style="margin-top:8px"><i id="bt-bar"></i></div>
+        <div class="cmp-note" id="bt-line2"></div>
+        <div class="cmp-note">خلي الشاشة شغالة وابقى بهذي الصفحة لحد ما يخلص.</div>
+        <button class="ghost danger" id="bt-stop" style="margin-top:10px">إيقاف</button>
+      </div>
+    </section>
     <section class="adm-card">
       <h3>إضافة فيديو</h3>
       <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button></div>
@@ -1012,8 +1166,11 @@ function buildAdmin() {
       <div class="lbl">الصورة المصغرة (اختياري، وإذا تركتها تنأخذ من الفيديو تلقائياً)</div>
       <label class="filebtn"><input type="file" id="in-thumb" accept="image/*" hidden><span id="in-thumb-name">اختر صورة من الهاتف</span></label>
       <input id="in-thumburl" type="url" dir="ltr" placeholder="أو رابط صورة" autocomplete="off">
+      <label class="chk" id="in-compress-row"><input type="checkbox" id="in-compress" checked><span>ضغط الفيديو بأقوى درجة (يوفر مساحة كبيرة)</span></label>
       <button class="primary" id="adm-add">إضافة</button>
       <div id="adm-status"></div>
+      <div class="cmp" id="adm-cmp" hidden><div class="cmp-bar"><i id="adm-cmp-bar"></i></div>
+        <div class="cmp-note">الضغط ياخذ نفس طول الفيديو تقريباً. خلي الشاشة شغالة ولا تطلع من الصفحة.</div></div>
     </section>
     <section class="adm-card"><h3 id="adm-count">الفيديوهات</h3><div id="adm-list"></div></section>
     <section class="adm-card" id="adm-adsform"></section>
@@ -1038,9 +1195,10 @@ function buildAdmin() {
     setSeg(id, b.dataset.v); cb(b.dataset.v);
   });
   $('#in-cloud-row').hidden = !CL.ok;
+  if (!canCompress()) { $('#in-compress').checked = false; $('#in-compress-row').hidden = true; }
   $('#in-cloud').onchange = e => { if (e.target.checked) $('#in-offline').checked = false; };
   $('#in-offline').onchange = e => { if (e.target.checked) $('#in-cloud').checked = false; };
-  seg('#seg-src', v => { adm.src = v; $('#src-file').hidden = v !== 'file'; $('#src-url').hidden = v !== 'url'; });
+  seg('#seg-src', v => { adm.src = v; $('#src-file').hidden = v !== 'file'; $('#src-url').hidden = v !== 'url'; $('#in-compress-row').hidden = v !== 'file' || !canCompress(); });
   seg('#seg-kind', v => { adm.kind = v; adm.kindTouched = true; });
 
   $('#in-file').onchange = e => {
@@ -1060,6 +1218,19 @@ function buildAdmin() {
     adm.thumbFile = f; $('#in-thumb-name').textContent = f.name;
   };
   $('#adm-add').onclick = onAdd;
+  $('#bt-files').onchange = e => {
+    const n = e.target.files.length;
+    $('#bt-name').textContent = n ? n + ' فيديو مختار' : 'اختر الفيديوهات';
+  };
+  if (!canCompress()) { $('#bt-cmp').checked = false; $('#bt-cmp-row').hidden = true; }
+  $('#bt-go').onclick = () => {
+    if (batch.running) return;
+    const files = Array.from($('#bt-files').files || []).filter(f => !f.type || f.type.startsWith('video/'));
+    if (!files.length) return toast('اختر فيديوهات أولاً');
+    runBatch(files, $('#bt-cmp').checked);
+  };
+  $('#bt-stop').onclick = () => { if (batch.running) { batch.cancel = true; if (batch.job && batch.job.abort) batch.job.abort(); updateBatchUI(); } };
+  updateBatchUI();
 
   $('#set-ch-ok').onclick = () => {
     const v = $('#set-ch').value.trim(); if (!v) return;
@@ -1225,7 +1396,7 @@ function renderAdminList() {
   box.innerHTML = state.all.map(v => `
     <div class="arow" data-id="${v.id}">
       <div class="at${v.kind === 'short' ? ' vert' : ''}"><img alt="" data-vid="${v.id}"></div>
-      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) : (v.cloud ? ' • سحابة' : ' • رابط')}</small></div>
+      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) + (v.compressed ? ' (مضغوط)' : '') : (v.cloud ? ' • سحابة' : ' • رابط')}</small></div>
       <button class="icon-btn danger" data-del="${v.id}" aria-label="حذف">${svg('trash')}</button>
     </div>`).join('');
   fillThumbs(box);
@@ -1243,6 +1414,7 @@ function renderAdminList() {
 
 async function onAdd() {
   if (adm.busy) return;
+  if (batch.running) return toast('الإضافة الجماعية شغالة، انتظر تخلص');
   const isFile = adm.src === 'file';
   const url = $('#in-url').value.trim();
   if (isFile && !adm.file) return toast('اختر فيديو أولاً');
@@ -1265,11 +1437,28 @@ async function doAdd(isFile, url) {
     thumbUrl: '', hasThumb: false, duration: 0, created: Date.now(), size: 0
   };
   const blobs = {};
-  let probe = null;
+  let probe = null, doneMsg = 'تمت الإضافة ✓';
+  // يبدأ الضغط فوراً داخل ضغطة الزر (قبل أي انتظار)
+  const cmpJob = isFile && $('#in-compress') && $('#in-compress').checked
+    ? compressVideo(adm.file, f => {
+        setStatus('جاري ضغط الفيديو ' + Math.round(f * 100) + '%');
+        const b = $('#adm-cmp-bar'); if (b) b.style.width = (f * 100) + '%';
+      })
+    : null;
   if (isFile) {
-    setStatus('جاري تجهيز الفيديو…');
+    setStatus(cmpJob ? 'جاري ضغط الفيديو…' : 'جاري تجهيز الفيديو…');
     probe = await adm.probing; if (!probe) probe = adm.probe;
-    blobs.video = adm.file; meta.hasBlob = true; meta.size = adm.file.size;
+    let vb = adm.file;
+    if (cmpJob) {
+      const box = $('#adm-cmp'); if (box) box.hidden = false;
+      const out = await cmpJob;
+      if (box) box.hidden = true;
+      if (out && out.size < adm.file.size * 0.95) {
+        vb = out; meta.compressed = true; meta.origSize = adm.file.size;
+        doneMsg = `تمت الإضافة ✓ الحجم صار ${fmtSize(out.size)} بدل ${fmtSize(adm.file.size)}`;
+      } else if (!out) toast('تعذر ضغط الفيديو على هذا الجهاز، انحفظ بحجمه الأصلي');
+    }
+    blobs.video = vb; meta.hasBlob = true; meta.size = vb.size;
   } else {
     if (!toCloud && $('#in-offline').checked) {
       try { const b = await downloadBlob(url, setStatus); blobs.video = b; meta.hasBlob = true; meta.size = b.size; }
@@ -1300,7 +1489,99 @@ async function doAdd(isFile, url) {
   else { await saveVideo(meta, blobs); await loadVideos(); }
   refreshAll();
   buildAdmin();
-  toast('تمت الإضافة ✓');
+  toast(doneMsg);
+}
+
+/* ---- إضافة مجموعة فيديوهات تلقائياً ---- */
+const batch = { running: false, cancel: false, job: null, i: 0, n: 0, frac: 0, name: '', ok: 0, fail: 0, orig: 0, now: 0, finished: false };
+const KT_MAIN = ['أجمل أغاني الأطفال', 'كرتون الأطفال المفضل', 'فيلم كرتون جديد', 'أغنية الحروف للأطفال', 'أغنية الأرقام للأطفال',
+  'قصة قبل النوم للأطفال', 'مغامرات الأرنب الصغير', 'رحلة الدب اللطيف', 'حفلة الحيوانات المرحة', 'سباق السيارات الصغيرة',
+  'عالم الألوان السحري', 'أنشودة الأطفال الجميلة', 'الديناصور الصغير الشجاع', 'القطة المشاكسة', 'الفيل الصغير والأصدقاء',
+  'رقصة الأطفال المرحة', 'أغنية الحيوانات', 'أغنية الألوان', 'حكاية الأميرة الصغيرة', 'بطل الغابة الشجاع', 'الفضائي الصغير',
+  'سفينة القراصنة المرحة', 'مدينة الألعاب', 'مزرعة الأصدقاء', 'أغنية الصباح للأطفال', 'أغنية النوم الهادئة',
+  'تعلّم العد مع الأصدقاء', 'تعلّم الحروف بالمرح', 'الشرطي الصغير', 'إطفائي الحي', 'الدلفين الذكي', 'الخروف الصغير',
+  'مغامرة تحت البحر', 'جزيرة الكنز للأطفال', 'السيارة الطائرة', 'القطار السريع', 'أصدقاء الغابة', 'الروبوت الطيب', 'الحصان الأبيض', 'كتكوت صغير'];
+const KT_TAIL = ['', '', ' | كرتون ممتع', ' | أغاني أطفال', ' | للأطفال', ' - حلقة جديدة', ' | فيلم كرتون كامل', ' | مرح وضحك', ' | أجمل الأناشيد', ' | رسوم متحركة'];
+const KT_EMO = ['🎵', '🎶', '😍', '🥰', '😂', '🤩', '🌈', '⭐', '🎬', '🧸', '🐰', '🐻', '🦁', '🚗', '🚀', '🎈', '🍭', '🦄', '🐥', '🎉', '👶', '🐶', '🐱', '🦖', '🍿'];
+const pick = a => a[Math.floor(Math.random() * a.length)];
+function kidTitle(used) {
+  for (let t = 0; t < 30; t++) {
+    const e = [pick(KT_EMO), pick(KT_EMO)]; if (Math.random() < 0.5) e.push(pick(KT_EMO));
+    const title = pick(KT_MAIN) + pick(KT_TAIL) + ' ' + Array.from(new Set(e)).join('');
+    if (!used.has(title)) { used.add(title); return title; }
+  }
+  const title = pick(KT_MAIN) + ' ' + (used.size + 1) + ' ' + pick(KT_EMO); used.add(title); return title;
+}
+function updateBatchUI() {
+  const box = $('#bt-prog'); if (!box) return;
+  const go = $('#bt-go'); if (go) go.disabled = batch.running;
+  box.hidden = !batch.running && !batch.finished;
+  const l1 = $('#bt-line1'), l2 = $('#bt-line2'), bar = $('#bt-bar'), stop = $('#bt-stop');
+  if (batch.running) {
+    const pct = batch.n ? Math.min(100, ((batch.i + batch.frac) / batch.n) * 100) : 0;
+    l1.textContent = batch.cancel ? 'جاري الإيقاف…' : `فيديو ${batch.i + 1} من ${batch.n} (${Math.round(batch.frac * 100)}%) — ${batch.name}`;
+    bar.style.width = pct + '%';
+    l2.textContent = `تمت إضافة ${batch.ok}` + (batch.fail ? ` • تعذر ${batch.fail}` : '') + (batch.orig > batch.now ? ` • وفّرنا ${fmtSize(batch.orig - batch.now)}` : '');
+    stop.hidden = false;
+  } else if (batch.finished) {
+    l1.textContent = `خلصت: تمت إضافة ${batch.ok} من ${batch.n}` + (batch.fail ? ` • تعذر ${batch.fail}` : '');
+    bar.style.width = '100%';
+    l2.textContent = batch.orig > batch.now ? `الحجم قبل ${fmtSize(batch.orig)} وبعد ${fmtSize(batch.now)}` : '';
+    stop.hidden = true;
+  }
+}
+// تبدأ مباشرة من ضغطة الزر: أول فيديو يبدأ ضغطه قبل أي انتظار
+async function runBatch(files, wantCmp) {
+  Object.assign(batch, { running: true, cancel: false, job: null, i: 0, n: files.length, frac: 0, name: '', ok: 0, fail: 0, orig: 0, now: 0, finished: false });
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  const comp = wantCmp ? makeCompressor() : null;
+  if (wantCmp && !comp) toast('هذا الجهاز ما يدعم الضغط، راح تنحفظ الفيديوهات بحجمها الأصلي');
+  const used = new Set(state.all.map(v => v.title));
+  let stopMsg = '';
+  updateBatchUI();
+  try {
+    for (let i = 0; i < files.length && !batch.cancel; i++) {
+      const file = files[i];
+      Object.assign(batch, { i, frac: 0, name: file.name });
+      updateBatchUI();
+      const u = URL.createObjectURL(file);
+      const job = comp ? comp.run(file, f => { batch.frac = f; updateBatchUI(); }) : null;
+      batch.job = job;
+      const probe = await probeVideo(u, { max: 480, q: 0.7, at: 0.2 });
+      URL.revokeObjectURL(u);
+      let vb = file, compressed = false;
+      if (job) {
+        const out = await job;
+        batch.job = null;
+        if (batch.cancel) break;
+        if (out && out.size < file.size * 0.95) { vb = out; compressed = true; }
+      }
+      const dur = probe && probe.duration ? probe.duration : 0;
+      const kind = dur ? (dur <= 60 ? 'short' : 'long') : (probe && probe.h > probe.w ? 'short' : 'long');
+      const meta = {
+        id: uid(), title: kidTitle(used), kind, src: 'file', url: '', hasBlob: true,
+        thumbUrl: '', hasThumb: false, duration: dur, created: Date.now() + i, size: vb.size
+      };
+      if (compressed) { meta.compressed = true; meta.origSize = file.size; }
+      const blobs = { video: vb };
+      if (probe && probe.thumb) { blobs.thumb = probe.thumb; meta.hasThumb = true; }
+      try { await saveVideo(meta, blobs); }
+      catch (e) {
+        console.error(e);
+        if (e && e.name === 'QuotaExceededError') { stopMsg = 'مساحة الهاتف ممتلئة، توقفت الإضافة'; break; }
+        batch.fail++; continue;
+      }
+      batch.ok++; batch.orig += file.size; batch.now += vb.size;
+      await loadVideos(); refreshAll(); renderAdminList();
+      updateBatchUI();
+    }
+  } catch (e) { console.error(e); stopMsg = 'صار خطأ وتوقفت الإضافة'; }
+  if (comp) comp.close();
+  batch.running = false; batch.finished = true; batch.job = null;
+  const left = batch.n - batch.ok - batch.fail;
+  updateBatchUI();
+  const f = $('#bt-files'); if (f) { f.value = ''; const nm = $('#bt-name'); if (nm) nm.textContent = 'اختر الفيديوهات'; }
+  toast(stopMsg || (batch.cancel ? `تم الإيقاف. انضافت ${batch.ok} فيديو` : `خلصت ✓ انضافت ${batch.ok} فيديو` + (batch.orig > batch.now ? ` ووفّرنا ${fmtSize(batch.orig - batch.now)}` : '')));
 }
 
 /* ---- الدخول: ضغطة مطولة على الشعار ---- */
@@ -1514,7 +1795,6 @@ function buildCtl() {
 /* ================= التشغيل ================= */
 async function init() {
   injectIcons();
-  setMuteIcon();
   try { db = await openDB(); }
   catch (e) { $('#home-list').innerHTML = '<div class="empty">تعذر فتح التخزين</div>'; return; }
   applyLite();
