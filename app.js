@@ -101,13 +101,14 @@ function injectIcons(root = document) {
 let db;
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open('utyub', 2);
+    const r = indexedDB.open('utyub', 3);
     r.onupgradeneeded = () => {
       const d = r.result, has = n => d.objectStoreNames.contains(n);
       if (!has('videos')) d.createObjectStore('videos', { keyPath: 'id' });
       if (!has('blobs')) d.createObjectStore('blobs');
       if (!has('history')) d.createObjectStore('history', { keyPath: 'videoId' });
       if (!has('ads')) d.createObjectStore('ads', { keyPath: 'id' });
+      if (!has('learn')) d.createObjectStore('learn');
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -734,6 +735,11 @@ async function startShort(s) {
 async function playShort(s) {
   activeShort = s;
   if (s._ad) { s._ad.resume(); return; }
+  if (s._gating) return;
+  if (!s._counted) {
+    s._counted = true;
+    if (gateShouldRun()) { s._gating = true; await runGate(); s._gating = false; if (activeShort !== s) return; }
+  }
   await attachShort(s);
   if (activeShort !== s || document.hidden) return;
   if (!s._adDone) {
@@ -880,6 +886,7 @@ let scrub = false;
 
 async function openWatch(id) {
   const v = state.byId.get(id); if (!v || !isVisible(v)) return;
+  if (gateShouldRun()) await runGate();
   const first = $('#watch').hidden, wasMini = W.mini;
   killWatchAd();
   pauseShorts();
@@ -1449,6 +1456,9 @@ function buildAdmin() {
   <div class="adm-head"><button class="icon-btn" id="adm-close" aria-label="إغلاق" data-ico="close"></button><h2>الإدارة</h2></div>
   <div class="adm-body">
     <section class="adm-card" id="adm-ctl"></section>
+    <section class="adm-card" id="adm-learn"></section>
+    <section class="adm-card" id="adm-items"></section>
+    <section class="adm-card" id="adm-missions"></section>
     <section class="adm-card" id="adm-batch">
       <h3>إضافة مجموعة فيديوهات (تلقائي)</h3>
       <div class="lbl">اختر الفيديوهات كلها مرة وحدة، والباقي ينسوي لحاله: ضغط، عنوان، صورة مصغرة، وحفظ على الهاتف. الفيديو دقيقة أو أقل يصير Short، وغيره فيديو طويل.</div>
@@ -1521,7 +1531,7 @@ function buildAdmin() {
   </div>`;
   injectIcons(el);
   renderAdminList();
-  buildAdsAdmin(); renderAdsList(); buildCtl();
+  buildAdsAdmin(); renderAdsList(); buildCtl(); buildLearnAdmin();
 
   $('#adm-close').onclick = closeAdmin;
   const seg = (id, cb) => $(id).addEventListener('click', e => {
@@ -2048,6 +2058,417 @@ async function runYtBatch(ex, toCloud) {
   toast(stopMsg || (ytb.cancel ? `تم الإيقاف. انضافت ${ytb.ok} فيديو` : `خلصت ✓ انضافت ${ytb.ok} فيديو يوتيوب` + (ytb.fail ? ` وتعذر ${ytb.fail}` : '')));
 }
 
+/* ================= تعليم الكلمات: لعبة صغيرة قبل الفيديو ================= */
+const LN = { local: { items: [], missions: [], settings: {} }, cloud: { items: [], missions: [], settings: {} }, items: [], missions: [], cfg: {}, last: '' };
+const LN_DEF = { everyN: 3, missionEvery: 0, name: '', praise: '' };
+const idbPut = (k, v) => { const tx = db.transaction('learn', 'readwrite'); tx.objectStore('learn').put(v, k); return txDone(tx); };
+function learnMerge() {
+  const mi = new Map(), mm = new Map();
+  LN.local.items.forEach(i => mi.set(i.id, i)); LN.cloud.items.forEach(i => mi.set(i.id, Object.assign({}, i, { cloud: true })));
+  LN.local.missions.forEach(i => mm.set(i.id, i)); LN.cloud.missions.forEach(i => mm.set(i.id, Object.assign({}, i, { cloud: true })));
+  LN.items = Array.from(mi.values()).sort((a, b) => (a.created || 0) - (b.created || 0));
+  LN.missions = Array.from(mm.values()).sort((a, b) => (a.created || 0) - (b.created || 0));
+  LN.cfg = Object.assign({}, LN_DEF, LN.local.settings, LN.cloud.settings);
+}
+async function learnLoad() {
+  try {
+    const l = await reqP(store('learn').get('local')); if (l) LN.local = Object.assign(LN.local, l);
+    const c = await reqP(store('learn').get('cloud')); if (c) LN.cloud = Object.assign(LN.cloud, c);
+  } catch (e) {}
+  learnMerge();
+}
+const lnStat = () => lsJSON('lstat', {});
+function lnMark(id, firstTry) {
+  const st = lnStat(), x = st[id] || { r: 0, t: 0, k: 0 };
+  x.t++; if (firstTry) { x.r++; x.k++; } else x.k = 0;
+  st[id] = x; LS.set('lstat', JSON.stringify(st));
+}
+// الصوت: تسجيلاتك أولاً، وإذا ما اكو يستخدم نطق الجهاز
+let lnAudio = null, lnAC = null;
+function lnPlay(url, maxMs) {
+  return new Promise(res => {
+    try { if (lnAudio) lnAudio.pause(); } catch (e) {}
+    if (!url) return res();
+    const a = lnAudio = new Audio(url);
+    let done = false;
+    const t = setTimeout(() => fin(), maxMs || 6000);
+    const fin = () => { if (done) return; done = true; clearTimeout(t); res(); };
+    a.onended = fin; a.onerror = fin;
+    const p = a.play(); if (p && p.catch) p.catch(fin);
+  });
+}
+function lnSpeak(text) {
+  return new Promise(res => {
+    try {
+      if (!text || !window.speechSynthesis) return res();
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text); u.lang = 'ar';
+      u.onend = res; u.onerror = res; speechSynthesis.speak(u); setTimeout(res, 4000);
+    } catch (e) { res(); }
+  });
+}
+const lnSay = (url, text) => (url ? lnPlay(url) : lnSpeak(text));
+function lnCtx() {
+  try { lnAC = lnAC || new (window.AudioContext || window.webkitAudioContext)(); if (lnAC.state === 'suspended') lnAC.resume(); return lnAC; }
+  catch (e) { return null; }
+}
+function lnClap() {
+  const ac = lnCtx(); if (!ac) return;
+  const len = Math.floor(ac.sampleRate * 0.07), buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+  const t0 = ac.currentTime;
+  for (let k = 0; k < 14; k++) {
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1200 + Math.random() * 1800;
+    const g = ac.createGain(); g.gain.value = 0.25 + Math.random() * 0.25;
+    src.connect(f); f.connect(g); g.connect(ac.destination);
+    src.start(t0 + k * 0.1 + Math.random() * 0.06);
+  }
+}
+function lnBoop() {
+  const ac = lnCtx(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+  o.type = 'sine'; o.frequency.setValueAtTime(260, t); o.frequency.exponentialRampToValueAtTime(190, t + 0.18);
+  g.gain.setValueAtTime(0.18, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + 0.22);
+}
+function lnPick() {
+  const its = LN.items.filter(i => i.img);
+  if (its.length < 2) return null;
+  const st = lnStat();
+  const w = i => ((st[i.id] && st[i.id].k >= 4) ? 1 : 4) * (i.id === LN.last ? 0.15 : 1);
+  let tot = its.reduce((a, i) => a + w(i), 0), r = Math.random() * tot, target = its[0];
+  for (const i of its) { r -= w(i); if (r <= 0) { target = i; break; } }
+  const others = its.filter(i => i.id !== target.id);
+  const wrong = others[Math.floor(Math.random() * others.length)];
+  LN.last = target.id;
+  return { target, wrong, flip: Math.random() < 0.5 };
+}
+const gateActive = () => (KID() || LS.get('gon', '0') === '1') && !(state.ctl && state.ctl.mode === 'locked');
+function gateHasContent() { return LN.items.filter(i => i.img).length >= 2 || LN.missions.length > 0; }
+function gateShouldRun() {
+  if (gateEl || !gateActive() || !gateHasContent()) return false;
+  const n = LN.cfg.everyN | 0; if (n <= 0) return false;
+  const c = +LS.get('gcnt', String(n));
+  if (c >= n) return true;
+  LS.set('gcnt', String(c + 1));
+  return false;
+}
+let gateEl = null;
+function lnPauseAll() {
+  try {
+    if (!$('#watch').hidden) { W.vid.pause(); if (W.yt) W.yt.pause(); }
+    $$('.short video').forEach(v => v.pause());
+    $$('.short.yt').forEach(unmountShortYt);
+  } catch (e) {}
+}
+function celebrate(root) {
+  return new Promise(res => {
+    const c = LN.cfg, nm = c.name ? ' ' + c.name : '';
+    const p = document.createElement('div'); p.className = 'g-party';
+    let h = '<div class="g-big ga">⭐</div><div class="g-praise">عافية' + esc(nm) + '</div><div class="g-clap">👏👏👏</div>';
+    for (let i = 0; i < 12; i++) h += `<i class="g-conf ga" style="left:${4 + i * 8}%;animation-delay:${(i % 4) * 0.2}s">${['⭐', '🎉', '✨', '🎈'][i % 4]}</i>`;
+    p.innerHTML = h; root.appendChild(p);
+    lnClap();
+    lnSay(c.praise, 'عافية' + nm);
+    setTimeout(res, 3300);
+  });
+}
+function runGate() {
+  return new Promise(resolve => {
+    if (gateEl) return resolve(false);
+    lnPauseAll();
+    const root = gateEl = document.createElement('div');
+    root.id = 'gate'; root.className = 'gate';
+    document.body.appendChild(root);
+    let finished = false, seq = 0, hintT = 0, doneTimer = 0;
+    const finish = r => {
+      if (finished) return; finished = true;
+      clearTimeout(hintT); clearTimeout(doneTimer); seq++;
+      try { if (lnAudio) lnAudio.pause(); if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
+      root.remove(); gateEl = null;
+      LS.set('gcnt', '0');
+      resolve(r);
+    };
+    const wireSkip = () => {
+      const sk = $('.g-skip', root); let t = 0;
+      sk.addEventListener('pointerdown', () => { clearTimeout(t); t = setTimeout(() => askCode(() => finish('skip')), 1500); });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => sk.addEventListener(ev, () => clearTimeout(t)));
+    };
+    const mission = LN.missions.length && (!gateHasPair() || ((LN.cfg.missionEvery | 0) > 0 && (+LS.get('gmiss', '0') + 1) % (LN.cfg.missionEvery | 0) === 0));
+    LS.set('gmiss', String((+LS.get('gmiss', '0') + 1) % 1000));
+    if (mission) {
+      const m = LN.missions[Math.floor(Math.random() * LN.missions.length)];
+      root.innerHTML = `<button class="g-skip" aria-label=""></button>
+        <div class="g-top"><button class="g-say" aria-label="سماع">${svg('volume')}</button></div>
+        <div class="g-m"><div class="g-card"><img src="${m.place}" alt=""></div><div class="g-arrow">⬇️</div>
+        <div class="g-card"><img src="${m.prize}" alt=""><div class="g-cap">${esc(m.text || '')}</div></div></div>
+        <button class="g-done">وصلت ✓</button>`;
+      wireSkip();
+      const say = () => lnSay(m.voice, m.text ? 'روح للمكان، اكو ' + m.text : '');
+      $('.g-say', root).onclick = say; say();
+      const done = $('.g-done', root);
+      setTimeout(() => done.classList.add('on'), 5000);
+      done.onclick = async () => {
+        if (!done.classList.contains('on')) return;
+        done.disabled = true; await celebrate(root); finish('ok');
+      };
+      return;
+    }
+    const q = lnPick();
+    if (!q) { finish('none'); return; }
+    const { target, wrong } = q;
+    const opts = q.flip ? [wrong, target] : [target, wrong];
+    root.innerHTML = `<button class="g-skip" aria-label=""></button>
+      <div class="g-top"><button class="g-say" aria-label="سماع">${svg('volume')}</button></div>
+      <div class="g-opts">${opts.map((it, i) => `<button class="g-opt" data-i="${i}"><img src="${it.img}" alt=""><span class="g-name">${esc(it.name || '')}</span></button>`).join('')}</div>
+      <div class="g-hand ga" hidden>👆</div>`;
+    wireSkip();
+    const hand = $('.g-hand', root);
+    const tBtn = $$('.g-opt', root)[opts.indexOf(target)], wBtn = $$('.g-opt', root)[opts.indexOf(wrong)];
+    let nWrong = 0, locked = false;
+    const showHand = () => {
+      if (finished || locked) return;
+      const r = tBtn.getBoundingClientRect(), rr = root.getBoundingClientRect();
+      hand.style.left = (r.left - rr.left + r.width / 2 - 30) + 'px';
+      hand.style.top = (r.top - rr.top + r.height * 0.5) + 'px';
+      hand.hidden = false;
+    };
+    const ask = () => lnSay(target.ask || target.voice, target.name ? 'وين ' + target.name : '');
+    $('.g-say', root).onclick = ask;
+    const armHint = ms => { clearTimeout(hintT); hintT = setTimeout(showHand, ms); };
+    ask(); armHint(4500);
+    root.addEventListener('click', async e => {
+      const b = e.target.closest('.g-opt'); if (!b || locked) return;
+      const it = opts[+b.dataset.i], my = ++seq;
+      clearTimeout(hintT);
+      if (it.id === target.id) {
+        locked = true; hand.hidden = true; b.classList.add('ok');
+        lnMark(target.id, nWrong === 0);
+        await lnSay(it.voice, it.name);
+        if (finished) return;
+        await celebrate(root); finish('ok');
+      } else {
+        nWrong++;
+        b.classList.remove('shake'); void b.offsetWidth; b.classList.add('shake');
+        lnBoop();
+        if (nWrong >= 2) wBtn.classList.add('dim');
+        showHand();
+        await lnSay(it.voice, it.name);
+        if (my !== seq || finished) return;
+        await ask();
+        armHint(3500);
+      }
+    });
+  });
+}
+function gateHasPair() { return LN.items.filter(i => i.img).length >= 2; }
+
+/* ---- الإدارة: الكلمات والمهام ---- */
+const lnMime = () => ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(t => { try { return window.MediaRecorder && MediaRecorder.isTypeSupported(t); } catch (e) { return false; } }) || '';
+// حقل تسجيل صوت: زر تسجيل/إيقاف + سماع + حذف
+function recField(box, label) {
+  box.className = 'rec';
+  box.innerHTML = `<div class="lbl">${label}</div><div class="rec-b"><button class="ghost rec-r" type="button">🎤 سجّل</button><button class="ghost rec-p" type="button" hidden>▶ سماع</button><button class="ghost rec-d danger" type="button" hidden>حذف</button></div><div class="cmp-note rec-s"></div>`;
+  box._data = '';
+  const r = $('.rec-r', box), pl = $('.rec-p', box), dl = $('.rec-d', box), st = $('.rec-s', box);
+  let mr = null, stream = null, timer = 0;
+  const show = () => { pl.hidden = dl.hidden = !box._data; st.textContent = box._data ? 'تم التسجيل ✓' : ''; r.textContent = box._data ? '🎤 سجّل من جديد' : '🎤 سجّل'; };
+  box.get = () => box._data;
+  box.set = v => { box._data = v || ''; show(); };
+  r.onclick = async () => {
+    if (mr && mr.state === 'recording') { mr.stop(); return; }
+    if (!navigator.mediaDevices || !window.MediaRecorder) return toast('التسجيل غير مدعوم بهذا المتصفح');
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e) { return toast('اسمح للموقع باستخدام المايكروفون'); }
+    const mime = lnMime(), chunks = [];
+    mr = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 24000 } : { audioBitsPerSecond: 24000 });
+    mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    mr.onstop = async () => {
+      clearTimeout(timer); stream.getTracks().forEach(t => t.stop());
+      const b = new Blob(chunks, { type: (mr.mimeType || mime || 'audio/webm').split(';')[0] });
+      if (b.size < 600) { st.textContent = 'التسجيل قصير، جرب مرة ثانية'; r.textContent = '🎤 سجّل'; return; }
+      box._data = await blobToDataURL(b); show();
+    };
+    mr.start(); r.textContent = '⏹ إيقاف'; st.textContent = 'جاري التسجيل… (أقصى 8 ثواني)';
+    timer = setTimeout(() => { try { mr.stop(); } catch (e) {} }, 8000);
+  };
+  pl.onclick = () => lnPlay(box._data);
+  dl.onclick = () => { box._data = ''; show(); };
+  return box;
+}
+function resizeImg(file, max) {
+  return new Promise(res => {
+    const u = URL.createObjectURL(file), im = new Image();
+    im.onload = () => {
+      URL.revokeObjectURL(u);
+      const sc = Math.min(1, max / Math.max(im.width, im.height)), c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(im.width * sc)); c.height = Math.max(1, Math.round(im.height * sc));
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      res(c.toDataURL('image/jpeg', 0.72));
+    };
+    im.onerror = () => { URL.revokeObjectURL(u); res(''); };
+    im.src = u;
+  });
+}
+// حقل صورة: اختيار من المعرض أو الكاميرا + معاينة
+function imgField(box, label) {
+  box.className = 'rec';
+  box.innerHTML = `<div class="lbl">${label}</div><label class="filebtn"><input type="file" accept="image/*" hidden><span>اختر صورة أو صوّر</span></label><img class="rec-img" alt="" hidden>`;
+  box._data = '';
+  const inp = $('input', box), im = $('.rec-img', box), sp = $('span', box);
+  inp.onchange = async () => {
+    const f = inp.files[0]; if (!f) return;
+    const d = await resizeImg(f, 360);
+    if (!d) return toast('تعذر قراءة الصورة');
+    box._data = d; im.src = d; im.hidden = false; sp.textContent = f.name;
+  };
+  box.get = () => box._data;
+  box.clear = () => { box._data = ''; im.hidden = true; inp.value = ''; sp.textContent = 'اختر صورة أو صوّر'; };
+  return box;
+}
+function renderLearnLists() {
+  const il = $('#it-list'), ml = $('#ms-list');
+  const st = lnStat();
+  if (il) {
+    il.innerHTML = LN.items.length ? LN.items.map(i => { const x = st[i.id]; return `<div class="arow" data-id="${i.id}">
+      <div class="at" style="width:48px;height:48px"><img alt="" src="${i.img}"></div>
+      <div class="ti"><b>${esc(i.name || '')}</b><small>${i.voice ? '🔊' : ''}${i.ask ? ' ❓' : ''}${i.cloud ? ' • سحابة' : ' • على هذا الجهاز'}${x ? ` • صح ${x.r} من ${x.t}` : ''}</small></div>
+      <button class="icon-btn danger" data-delitem="${i.id}" aria-label="حذف">${svg('trash')}</button></div>`; }).join('') : '<div class="muted">ما أضفت كلمات بعد (تحتاج 2 على الأقل)</div>';
+    $$('[data-delitem]', il).forEach(b => b.onclick = () => learnDel('items', b.dataset.delitem));
+  }
+  if (ml) {
+    ml.innerHTML = LN.missions.length ? LN.missions.map(m => `<div class="arow">
+      <div class="at" style="width:48px;height:48px"><img alt="" src="${m.prize}"></div>
+      <div class="ti"><b>${esc(m.text || 'مهمة')}</b><small>${m.voice ? '🔊' : ''}${m.cloud ? ' • سحابة' : ' • على هذا الجهاز'}</small></div>
+      <button class="icon-btn danger" data-delms="${m.id}" aria-label="حذف">${svg('trash')}</button></div>`).join('') : '<div class="muted">ما اكو مهام</div>';
+    $$('[data-delms]', ml).forEach(b => b.onclick = () => learnDel('missions', b.dataset.delms));
+  }
+}
+async function learnDel(kind, id) {
+  if (!confirm('حذف؟')) return;
+  try {
+    const it = LN[kind].find(x => x.id === id);
+    if (it && it.cloud) await withTimeout(CL.db.ref('learn/' + kind + '/' + id).remove());
+    LN.local[kind] = LN.local[kind].filter(x => x.id !== id);
+    await idbPut('local', LN.local);
+    LN.cloud[kind] = LN.cloud[kind].filter(x => x.id !== id);
+    learnMerge(); renderLearnLists(); toast('تم الحذف');
+  } catch (e) { toast('تعذر الحذف'); }
+}
+async function learnSave(kind, obj, share) {
+  if (share && CL.ok) {
+    await withTimeout(CL.db.ref('learn/' + kind + '/' + obj.id).set(obj));
+    LN.cloud[kind] = LN.cloud[kind].filter(x => x.id !== obj.id).concat([obj]);
+  } else {
+    LN.local[kind] = LN.local[kind].concat([obj]);
+    await idbPut('local', LN.local);
+  }
+  learnMerge(); renderLearnLists();
+}
+function buildLearnAdmin() {
+  const c1 = $('#adm-learn'), c2 = $('#adm-items'), c3 = $('#adm-missions');
+  if (!c1 || !c2 || !c3) return;
+  const cfg = LN.cfg;
+  c1.innerHTML = `<h3>تعليم الكلمات: لعبة قبل الفيديو</h3>
+    <div class="lbl">تطلع للطفل لعبة صغيرة (يسمع الكلمة ويختار الصورة الصح) وبعدها يشتغل الفيديو. تحتاج تضيف كلمتين على الأقل (بالبطاقة اللي تحتها).</div>
+    <label class="chk"><input type="checkbox" id="ln-on"><span>تشغيل اللعبة على هذا الجهاز</span></label>
+    <div class="lbl">كل كم فيديو تطلع اللعبة؟ (0 = إيقاف)</div>
+    <input id="ln-every" type="number" min="0" max="20" inputmode="numeric" value="${cfg.everyN}">
+    <div class="lbl">اسم الطفل (يطلع بالتشجيع)</div>
+    <input id="ln-name" type="text" value="${esc(cfg.name)}" placeholder="مثلاً: محمد" autocomplete="off">
+    <div id="ln-praise"></div>
+    <div class="lbl">مهمة المكان تطلع كل كم لعبة؟ (0 = إيقاف)</div>
+    <input id="ln-mevery" type="number" min="0" max="20" inputmode="numeric" value="${cfg.missionEvery}">
+    <label class="chk" id="ln-cloud-row"><input type="checkbox" id="ln-cloud" checked><span>مشاركة بالسحابة (تظهر على جهاز الطفل)</span></label>
+    <button class="primary" id="ln-save">حفظ الإعدادات</button>
+    <button class="ghost" id="ln-try" style="width:100%;margin-top:8px">جرّب اللعبة الآن</button>`;
+  c2.innerHTML = `<h3>الكلمات والصور</h3>
+    <div class="lbl">أضف أشياء يعرفها (ماي، حليب، عصير…). صوّر الشيء الحقيقي من بيتكم أحسن من صورة جاهزة.</div>
+    <input id="it-name" type="text" placeholder="الكلمة (مثلاً: ماي)" autocomplete="off">
+    <div id="it-img"></div><div id="it-voice"></div><div id="it-ask"></div>
+    <button class="primary" id="it-add">إضافة الكلمة</button>
+    <div id="it-list" style="margin-top:10px"></div>`;
+  c3.innerHTML = `<h3>مهمة المكان</h3>
+    <div class="lbl">مثال: صورة الثلاجة، وصورة الجيلاتين، وصوتك: «روح للثلاجة، اكو جيلاتين». الطفل يروح للمكان معك، ويضغط «وصلت».</div>
+    <input id="ms-text" type="text" placeholder="الجائزة (مثلاً: جيلاتين)" autocomplete="off">
+    <div id="ms-place"></div><div id="ms-prize"></div><div id="ms-voice"></div>
+    <button class="primary" id="ms-add">إضافة المهمة</button>
+    <div id="ms-list" style="margin-top:10px"></div>`;
+  $('#ln-on').checked = LS.get('gon', '0') === '1';
+  const praise = recField($('#ln-praise'), 'صوت التشجيع (مثل: «عافية محمد»)'); praise.set(cfg.praise);
+  const share = () => !!(CL.ok && $('#ln-cloud').checked);
+  if (!CL.ok) $('#ln-cloud-row').hidden = true;
+  const itImg = imgField($('#it-img'), 'صورة الشيء'), itVoice = recField($('#it-voice'), 'صوتك وأنت تقول الكلمة (مثل: «ماي ماي»)'), itAsk = recField($('#it-ask'), 'صوتك وأنت تسأل (مثل: «وين الماي؟»)');
+  const msPlace = imgField($('#ms-place'), 'صورة المكان'), msPrize = imgField($('#ms-prize'), 'صورة الجائزة'), msVoice = recField($('#ms-voice'), 'صوتك (مثل: «روح للثلاجة، اكو جيلاتين»)');
+  $('#ln-save').onclick = async () => {
+    const nc = { everyN: Math.max(0, Math.min(20, parseInt($('#ln-every').value, 10) || 0)), missionEvery: Math.max(0, Math.min(20, parseInt($('#ln-mevery').value, 10) || 0)), name: $('#ln-name').value.trim(), praise: praise.get() };
+    LS.set('gon', $('#ln-on').checked ? '1' : '0');
+    try {
+      LN.local.settings = nc; await idbPut('local', LN.local);
+      if (share()) { await withTimeout(CL.db.ref('learn/settings').set(nc)); LN.cloud.settings = nc; }
+      learnMerge(); toast('تم الحفظ ✓');
+    } catch (e) { toast('تعذر الحفظ'); }
+  };
+  $('#ln-try').onclick = async () => {
+    if (!gateHasContent()) return toast('أضف كلمتين على الأقل أول');
+    await runGate();
+  };
+  $('#it-add').onclick = async () => {
+    const name = $('#it-name').value.trim();
+    if (!name) return toast('اكتب الكلمة');
+    if (!itImg.get()) return toast('اختر صورة');
+    const it = { id: uid(), name, img: itImg.get(), voice: itVoice.get(), ask: itAsk.get(), created: Date.now() };
+    try {
+      await learnSave('items', it, share());
+      $('#it-name').value = ''; itImg.clear(); itVoice.set(''); itAsk.set(''); toast('تمت الإضافة ✓');
+    } catch (e) { console.error(e); toast(e && e.name === 'QuotaExceededError' ? 'مساحة الهاتف ممتلئة' : 'تعذر الحفظ'); }
+  };
+  $('#ms-add').onclick = async () => {
+    if (!msPlace.get() || !msPrize.get()) return toast('اختر صورة المكان وصورة الجائزة');
+    const m = { id: uid(), text: $('#ms-text').value.trim(), place: msPlace.get(), prize: msPrize.get(), voice: msVoice.get(), created: Date.now() };
+    try {
+      await learnSave('missions', m, share());
+      $('#ms-text').value = ''; msPlace.clear(); msPrize.clear(); msVoice.set(''); toast('تمت الإضافة ✓');
+    } catch (e) { console.error(e); toast('تعذر الحفظ'); }
+  };
+  renderLearnLists();
+}
+const GATE_CSS = `
+.gate{position:fixed;inset:0;z-index:35;background:#fff8e7;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:16px;direction:rtl;color:#222;overflow:hidden}
+.g-skip{position:absolute;top:0;left:0;width:64px;height:64px;opacity:0}
+.g-say{width:84px;height:84px;border-radius:50%;background:#3ea6ff;color:#fff;display:grid;place-items:center}
+.g-say svg{width:46px;height:46px}
+.g-opts{display:flex;gap:14px;width:100%;justify-content:center}
+.g-opt{position:relative;flex:1;max-width:46vw;aspect-ratio:1/1.12;background:#fff;border-radius:24px;border:5px solid #f0e2bd;padding:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px}
+.g-opt img{width:100%;height:76%;object-fit:cover;border-radius:16px}
+.g-name{font-size:26px;font-weight:700;min-height:30px}
+.g-opt.ok{border-color:#2eb872;background:#eafff3}
+.g-opt.dim{opacity:.28;pointer-events:none}
+.g-hand{position:absolute;font-size:64px;line-height:1;pointer-events:none;z-index:2}
+.g-m{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%}
+.g-card{display:flex;flex-direction:column;align-items:center;gap:4px}
+.g-card img{width:min(52vw,220px);aspect-ratio:1;object-fit:cover;border-radius:22px;border:5px solid #f0e2bd;background:#fff}
+.g-cap{font-size:26px;font-weight:700}
+.g-arrow{font-size:40px;line-height:1}
+.g-done{background:#2eb872;color:#fff;font-size:28px;font-weight:800;border-radius:32px;padding:16px 44px;opacity:.35}
+.g-done.on{opacity:1}
+.g-party{position:absolute;inset:0;background:#fff8e7;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;z-index:3}
+.g-big{font-size:112px;line-height:1}
+.g-praise{font-size:42px;font-weight:800;color:#e67700}
+.g-clap{font-size:58px}
+.g-conf{position:absolute;top:-12%;font-size:34px;font-style:normal}
+#gate#gate .g-hand.ga{animation:gtap .9s infinite ease-in-out!important}
+#gate#gate .g-conf.ga{animation:gfall 2.4s linear infinite!important}
+#gate#gate .g-big.ga{animation:gpop .6s ease-out!important}
+#gate#gate .g-opt.shake{animation:gshake .4s!important}
+@keyframes gtap{0%,100%{transform:translateY(0)}50%{transform:translateY(-18px)}}
+@keyframes gfall{0%{transform:translateY(0)}100%{transform:translateY(115vh)}}
+@keyframes gpop{0%{transform:scale(.3)}70%{transform:scale(1.2)}100%{transform:scale(1)}}
+@keyframes gshake{25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+.rec{margin:6px 0}.rec-b{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.rec-img{width:96px;height:96px;object-fit:cover;border-radius:12px;margin-top:6px}`;
+(function () { if (!document.getElementById('gate-css')) { const st = document.createElement('style'); st.id = 'gate-css'; st.textContent = GATE_CSS; document.head.appendChild(st); } })();
+
 /* ---- الدخول: ضغطة مطولة على الشعار ---- */
 let lp = null;
 const brand = $('#brand');
@@ -2055,7 +2476,7 @@ brand.addEventListener('pointerdown', () => { clearTimeout(lp); lp = setTimeout(
 ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => brand.addEventListener(ev, () => clearTimeout(lp)));
 brand.addEventListener('contextmenu', e => e.preventDefault());
 
-function askCode() {
+function askCode(onOk) {
   const m = $('#modal');
   m.hidden = false;
   m.innerHTML = `<div class="dlg"><h3>الرمز السري</h3>
@@ -2064,7 +2485,7 @@ function askCode() {
   const inp = $('#code-in'); inp.focus();
   const close = () => { m.hidden = true; m.innerHTML = ''; };
   const submit = () => {
-    if (inp.value === LS.get('code', '1234')) { close(); openAdmin(); }
+    if (inp.value === LS.get('code', '1234')) { close(); if (typeof onOk === 'function') onOk(); else openAdmin(); }
     else { inp.value = ''; inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake'); toast('الرمز غير صحيح'); }
   };
   $('#code-ok').onclick = submit;
@@ -2100,6 +2521,12 @@ function startCloud() {
     state.cloudAds = Object.keys(o).map(k => Object.assign({}, o[k], { cloud: true, hasBlob: false, videoIds: o[k].videoIds || [] }));
     LS.set('ca', JSON.stringify(state.cloudAds));
     rebuildAds(); renderAdsList(); if (typeof refreshCtlLists === 'function') refreshCtlLists();
+  }, cloudErr);
+  CL.db.ref('learn').on('value', snap => {
+    const o = snap.val() || {};
+    LN.cloud = { settings: o.settings || {}, items: Object.values(o.items || {}), missions: Object.values(o.missions || {}) };
+    idbPut('cloud', LN.cloud).catch(() => {});
+    learnMerge(); renderLearnLists();
   }, cloudErr);
   CL.db.ref('control/kid').on('value', snap => {
     state.ctl = snap.val() || {};
@@ -2271,6 +2698,7 @@ async function init() {
   state.cloud = lsJSON('cv', []); state.cloudAds = lsJSON('ca', []); state.ctl = lsJSON('cc', {});
   await loadVideos();
   await loadAds();
+  await learnLoad();
   $('#lock').hidden = !(KID() && state.ctl.mode === 'locked');
   renderHome(); navIcons('home');
   startCloud();
