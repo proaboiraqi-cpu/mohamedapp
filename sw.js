@@ -1,8 +1,9 @@
 // يخزّن ملفات التطبيق حتى يفتح بدون إنترنت. الفيديوهات تنحفظ بشكل منفصل داخل التطبيق (IndexedDB).
-const CACHE = 'utyub-v11';
+const CACHE = 'utyub-v12';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'cloud.js', 'manifest.json',
-  'logo.png', 'wordmark.png', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'
+  'logo.png', 'wordmark.png', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png',
+  'kid-point.webp', 'kid-happy.webp', 'kid-clap.webp', 'kid-angry.webp'
 ];
 
 self.addEventListener('install', e => {
