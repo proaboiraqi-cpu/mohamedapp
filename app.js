@@ -146,7 +146,11 @@ function shuffle(a) {
   return b;
 }
 const homeRank = new Map();
-const rank = id => { if (!homeRank.has(id)) homeRank.set(id, Math.random()); return homeRank.get(id); };
+let homePrev = new Set(), homeTop = [], homeHiddenAt = 0;
+try { homePrev = new Set(JSON.parse(LS.get('hp', '[]')) || []); } catch (e) {}
+// الفيديوهات اللي طلعت بمقدمة الصفحة المرة الماضية تنزل لآخر القائمة، حتى كل مرة تشوف غيرها
+const rank = id => { if (!homeRank.has(id)) homeRank.set(id, Math.random() + (homePrev.has(id) ? 1 : 0)); return homeRank.get(id); };
+function reshuffleHome() { homePrev = new Set(homeTop); homeRank.clear(); }
 const byRank = arr => arr.slice().sort((a, b) => rank(a.id) - rank(b.id));
 const longs = () => state.videos.filter(v => v.kind !== 'short');
 const shorts = () => state.videos.filter(v => v.kind === 'short');
@@ -274,6 +278,7 @@ function renderHome() {
   let L = byRank(longs()), S = byRank(shorts());
   if (q) { L = L.filter(v => v.title.toLowerCase().includes(q)); S = []; }
   homeL = L; homeS = S; homeShown = 0;
+  if (!q) { homeTop = L.slice(0, 8).concat(S.slice(0, 6)).map(v => v.id); LS.set('hp', JSON.stringify(homeTop)); }
   if (!L.length && !S.length) {
     box.innerHTML = `<div class="empty">${logo(64)}<div>${q ? 'لا توجد نتائج' : 'لا توجد فيديوهات'}</div></div>`;
     return;
@@ -284,14 +289,12 @@ function renderHome() {
 // يضيف دفعة جديدة من الفيديوهات كلما قرّب المستخدم من نهاية الصفحة
 function addHomeBatch() {
   const box = $('#home-list');
-  if (homeShown >= homeL.length && !(homeShown === 0 && homeS.length)) return;
+  const first = homeShown === 0;
+  if (homeShown >= homeL.length && !(first && homeS.length)) return;
   const end = Math.min(homeShown + homePage(), homeL.length);
   let html = '';
-  for (let i = homeShown; i < end; i++) {
-    html += cardHTML(homeL[i]);
-    if (i === 1 && homeS.length) html += shelfHTML(homeS);
-  }
-  if (homeL.length < 2 && homeS.length && homeShown === 0) html += shelfHTML(homeS);
+  if (first && homeS.length) html += shelfHTML(homeS.slice(0, 24)); // الشورتات أول شي، وتحتها الفيديوهات الطويلة
+  for (let i = homeShown; i < end; i++) html += cardHTML(homeL[i]);
   homeShown = end;
   const w = document.createElement('div');
   w.style.display = 'contents';
@@ -318,7 +321,8 @@ function ytParse(input) {
     if (u.pathname === '/watch') id = u.searchParams.get('v') || '';
     else { const m = u.pathname.match(/^\/(shorts|embed|live|v)\/([\w-]{11})/); if (m) { id = m[2]; short = m[1] === 'shorts'; } }
   }
-  return /^[\w-]{11}$/.test(id) ? { id, short } : null;
+  id = (String(id).match(/^[\w-]{11}/) || [''])[0];
+  return id ? { id, short } : null;
 }
 function ytURL(id, o) {
   const q = new URLSearchParams({
@@ -362,14 +366,73 @@ function ytAttach(frame, h) {
   ytApi().then(YT => {
     if (c.dead) return;
     c.p = new YT.Player(frame, { events: {
-      onStateChange: e => { if (e.data === 0) { try { c.p.seekTo(0, true); c.p.playVideo(); } catch (x) {} } },
+      onReady: () => { if (h && h.onReady) h.onReady(); },
+      onStateChange: e => {
+        if (e.data === 0) { try { c.p.seekTo(0, true); c.p.playVideo(); } catch (x) {} }
+        if (h && h.onState) h.onState(e.data);
+      },
       onError: e => { if (h && h.onError) h.onError(e.data); }
     } });
   }).catch(() => {});
-  c.pause = () => { try { if (c.p && c.p.pauseVideo) c.p.pauseVideo(); } catch (e) {} };
-  c.play = () => { try { if (c.p && c.p.playVideo) c.p.playVideo(); } catch (e) {} };
+  const call = (fn, d) => { try { const r = c.p && c.p[fn] ? c.p[fn].apply(c.p, d.args || []) : undefined; return r === undefined ? d.def : r; } catch (e) { return d.def; } };
+  c.pause = () => call('pauseVideo', {});
+  c.play = () => call('playVideo', {});
+  c.seek = t => call('seekTo', { args: [t, true] });
+  c.getState = () => { const r = call('getPlayerState', { def: -1 }); return typeof r === 'number' ? r : -1; };
+  c.getTime = () => +call('getCurrentTime', { def: 0 }) || 0;
+  c.getDur = () => +call('getDuration', { def: 0 }) || 0;
   c.kill = () => { c.dead = true; try { if (c.p && c.p.destroy) c.p.destroy(); } catch (e) {} };
   return c;
+}
+// يستخرج كل روابط يوتيوب من نص (حتى لو ملتصقة ببعض أو وسط كلام): كل رابط يبدأ بـ http(s)://
+function ytExtractAll(text) {
+  const parts = String(text || '').split(/(?=https?:\/\/)/i);
+  const items = [], seen = new Set();
+  let total = 0, bad = 0;
+  for (const part of parts) {
+    if (!/^https?:\/\//i.test(part)) continue;
+    total++;
+    const tok = part.split(/[\s,;"'<>()\[\]{}|\\]/)[0];
+    const p = ytParse(tok);
+    if (!p) { bad++; continue; }
+    if (seen.has(p.id)) continue;
+    seen.add(p.id); items.push(p);
+  }
+  return { items, total, bad, dup: total - bad - items.length };
+}
+// يفتح الفيديو بمشغل مخفي لحظة حتى نعرف مدته وعنوانه (وإذا ممنوع التضمين أو غير متوفر يرجع err)
+function ytMeta(id) {
+  return new Promise(async res => {
+    let YT; try { YT = await ytApi(); } catch (e) { return res({ err: 'api' }); }
+    const f = ytFrame(id, { autoplay: false, controls: false });
+    f.className = '';
+    f.style.cssText = 'position:fixed;left:-400px;top:0;width:200px;height:113px;border:0;opacity:.02;pointer-events:none';
+    document.body.appendChild(f);
+    let p = null, done = false, iv = 0, to = 0;
+    const last = { d: 0, t: '' };
+    const finish = r => {
+      if (done) return; done = true; clearInterval(iv); clearTimeout(to);
+      try { if (p && p.destroy) p.destroy(); } catch (e) {}
+      try { f.remove(); } catch (e) {}
+      res(r);
+    };
+    to = setTimeout(() => finish({ dur: last.d, title: last.t, timeout: true }), 14000);
+    try {
+      p = new YT.Player(f, { events: {
+        onReady: () => {
+          try { p.mute(); p.playVideo(); } catch (e) {}
+          iv = setInterval(() => {
+            try {
+              const d = p.getDuration(); if (d > 0) last.d = d;
+              const vd = p.getVideoData && p.getVideoData(); if (vd && vd.title) last.t = vd.title;
+            } catch (e) {}
+            if (last.d > 0 && last.t) finish({ dur: last.d, title: last.t });
+          }, 250);
+        },
+        onError: e => finish({ err: e.data })
+      } });
+    } catch (e) { finish({ err: 'init' }); }
+  });
 }
 function ytThumb(id) {
   const base = 'https://i.ytimg.com/vi/' + id + '/';
@@ -390,17 +453,64 @@ async function ytTitle(id) {
     return (j && j.title) ? String(j.title).trim() : '';
   } catch (e) { return ''; }
 }
+// نخلّي مشغل يوتيوب يتصرف مثل <video> عادي، حتى تشتغل أزرارنا (تشغيل، شريط التقدم، تقديم 10 ثواني، المصغّر) بنفس الكود
+function removeYtFacade() {
+  const f = W.yf; if (!f) return;
+  clearInterval(f.iv);
+  ['paused', 'ended', 'duration', 'currentTime'].forEach(k => { try { delete W.vid[k]; } catch (e) {} });
+  try { delete W.vid.play; delete W.vid.pause; } catch (e) {}
+  W.yf = null;
+}
+function installYtFacade(ctl) {
+  removeYtFacade();
+  const vid = W.vid, st = { t: 0, at: 0, d: 0, s: -1 };
+  const ev = n => vid.dispatchEvent(new Event(n));
+  const def = (k, o) => Object.defineProperty(vid, k, Object.assign({ configurable: true }, o));
+  def('paused', { get: () => !(st.s === 1 || st.s === 3) });
+  def('ended', { get: () => false });
+  def('duration', { get: () => (st.d > 0 ? st.d : NaN) });
+  def('currentTime', {
+    get: () => { const t = st.s === 1 ? st.t + (performance.now() - st.at) / 1000 : st.t; return st.d > 0 ? Math.min(t, st.d) : t; },
+    set: v => { st.t = v; st.at = performance.now(); ctl.seek(v); }
+  });
+  vid.play = () => { ctl.play(); return Promise.resolve(); };
+  vid.pause = () => { ctl.pause(); };
+  const setS = s => {
+    if (s === st.s) return;
+    const was = st.s; st.s = s; st.at = performance.now();
+    if (s === 1) { ev('play'); ev('playing'); }
+    else if (s === 3) ev('waiting');
+    else if (was === 1 || was === 3) ev('pause');
+  };
+  const iv = setInterval(() => {
+    setS(ctl.getState());
+    const d = ctl.getDur();
+    if (d > 0 && d !== st.d) { st.d = d; ev('loadedmetadata'); ev('durationchange'); }
+    st.t = ctl.getTime(); st.at = performance.now();
+    ev('timeupdate');
+  }, 250);
+  W.yf = { st, iv, setS };
+}
 function dropYtFrame() {
+  removeYtFacade();
   if (W.yt) { W.yt.kill(); W.yt = null; }
   const f = $('#yt-frame'); if (f) f.remove();
 }
 function stopYtWatch() { dropYtFrame(); $('#watch').classList.remove('yt'); }
+// المشغل بدون أزرار يوتيوب، وفوقه أزرارنا وطبقة اللمس (سحب للأسفل، تقديم، إلخ) مثل فيديوهات الهاتف
 function mountWatchYt(v) {
   dropYtFrame();
-  const f = ytFrame(v.ytId, { autoplay: true, controls: true });
+  const f = ytFrame(v.ytId, { autoplay: true, controls: false });
   f.id = 'yt-frame';
-  W.player.appendChild(f);
-  W.yt = ytAttach(f, { onError: c => toast(ytErrMsg(c)) });
+  W.player.insertBefore(f, W.ov);
+  const ctl = ytAttach(f, {
+    onError: c => { spin(false); toast(ytErrMsg(c)); },
+    onState: s => { if (W.yf) W.yf.setS(s); }
+  });
+  W.yt = ctl;
+  installYtFacade(ctl);
+  spin(true); setTimeout(() => { if (W.yt === ctl) spin(false); }, 8000);
+  showCtl(); updPlay(); updProg();
 }
 function openYtWatch(v, first, wasMini) {
   const old = W.url; W.url = null;
@@ -428,33 +538,48 @@ function mountShortYt(s) {
   if (s._yt) return;
   const v = state.byId.get(s.dataset.id); if (!v || !v.ytId) return;
   const f = ytFrame(v.ytId, { autoplay: true, controls: false, short: true });
-  s.insertBefore(f, s.firstChild);
+  s.insertBefore(f, $('.yt-tap', s) || s.firstChild);
   s._ytf = f;
-  s._yt = ytAttach(f, { onError: c => toast(ytErrMsg(c)) });
+  const c = s._yt = ytAttach(f, { onError: code => toast(ytErrMsg(code)) });
+  const bar = $('.s-prog i', s);
+  clearInterval(s._ytIv);
+  s._ytIv = setInterval(() => { const d = c.getDur(); if (d > 0 && bar) bar.style.width = (c.getTime() / d * 100) + '%'; }, 500);
 }
 function unmountShortYt(s) {
+  clearInterval(s._ytIv);
   if (s._yt) { s._yt.kill(); s._yt = null; }
   if (s._ytf) { s._ytf.remove(); s._ytf = null; }
+  const bar = $('.s-prog i', s); if (bar) bar.style.width = '0';
 }
-
+function toggleShortYt(s) {
+  if (!s._yt) return;
+  const fl = $('.s-flash', s), st = s._yt.getState();
+  if (st === 1 || st === 3) { s._yt.pause(); fl.innerHTML = svg('pause'); } else { s._yt.play(); fl.innerHTML = svg('play'); }
+  fl.classList.remove('go'); void fl.offsetWidth; fl.classList.add('go');
+}
 // نفس قواعد يوتيوب بملف style.css، منسوخة هنا حتى تشتغل حتى لو الهاتف عنده نسخة قديمة من الستايل
 function injectYtCss() {
   if (document.getElementById('yt-css')) return;
   const st = document.createElement('style'); st.id = 'yt-css';
   st.textContent = `
-.yt-bar{display:none}
-#watch.yt .yt-bar{display:flex;flex:none;height:40px;align-items:center;padding:0 4px;background:var(--bg)}
-#watch.yt.mini .yt-bar{display:none}
-#watch.yt #vid,#watch.yt .p-overlay,#watch.yt #p-spin,#watch.yt #p-skip{display:none}
-#watch.yt .player{touch-action:auto}
-.yt-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
-@media (orientation:landscape) and (max-height:520px){#watch.yt .yt-bar{display:none}}
-.short.yt video,.short.yt .s-shade,.short.yt .s-prog,.short.yt .s-flash{display:none}
-.short.yt .yt-frame.sh{inset:auto;top:0;left:0;width:100%;height:calc(100% - 136px)}
-.short.yt .s-actions{left:0;right:0;bottom:0;height:62px;flex-direction:row;justify-content:space-around;align-items:center;gap:0}
-.short.yt .s-info{left:12px;right:12px;bottom:66px}
-.short.yt .s-info p{margin-top:6px;-webkit-line-clamp:1}
-.s-btn.up svg{transform:rotate(180deg)}`;
+.yt-bar{display:none!important}
+.yt-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;pointer-events:none}
+#watch.yt #vid{display:none}
+#watch.yt:not(.mini) .p-overlay,#watch.yt:not(.mini) #p-spin,#watch.yt:not(.mini) #p-skip{display:block}
+#watch.yt .player{touch-action:none}
+#watch.yt.mini .p-overlay{display:block;background:none}
+#watch.yt.mini .p-overlay>*{display:none}
+#watch.yt.mini #p-spin,#watch.yt.mini #p-skip{display:none}
+.yt-tap{position:absolute;inset:0}
+.short.yt video{display:none}
+.short.yt .yt-frame.sh{inset:auto;left:50%;top:50%;width:auto;height:100%;aspect-ratio:9/16;transform:translate(-50%,-50%)}
+.short.yt .s-shade,.short.yt .s-prog{display:block}
+.short.yt .s-flash{display:grid}
+.short.yt .s-actions{left:6px;right:auto;bottom:64px;top:auto;height:auto;flex-direction:column;justify-content:flex-start;align-items:center;gap:16px}
+.short.yt .s-info{left:84px;right:12px;bottom:16px}
+.short.yt .s-info p{margin-top:10px;-webkit-line-clamp:2}
+.adm-card textarea{width:100%;background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin:6px 0;outline:none;font:13px/1.5 monospace;color:var(--text);resize:vertical;-webkit-user-select:text;user-select:text}
+.adm-card textarea:focus{border-color:var(--blue)}`;
   document.head.appendChild(st);
 }
 injectYtCss();
@@ -652,15 +777,14 @@ function addShort(v) {
   const s = document.createElement('section');
   const yt = !!v.ytId;
   s.className = 'short' + (yt ? ' yt' : ''); s.dataset.id = v.id; s._tok = 0;
-  s.innerHTML = `<video playsinline webkit-playsinline loop preload="none"${yt ? ' hidden' : ''}></video>
+  s.innerHTML = `<video playsinline webkit-playsinline loop preload="none"${yt ? ' hidden' : ''}></video>${yt ? '<div class="yt-tap"></div>' : ''}
       <div class="s-shade"></div>
       <div class="s-flash"></div>
       <div class="s-actions">
-        ${yt ? `<button class="s-btn up" data-nav="-1">${svg('down')}<span>السابق</span></button>` : ''}
         <button class="s-btn" data-toggle="like">${svg('like')}<span>أعجبني</span></button>
         <button class="s-btn" data-toggle="dislike">${svg('dislike')}<span>لا يعجبني</span></button>
-        ${yt ? `<button class="s-btn" data-nav="1">${svg('down')}<span>التالي</span></button>` : `<button class="s-btn">${svg('comment')}<span>تعليق</span></button>
-        <button class="s-btn">${svg('share')}<span>مشاركة</span></button>`}
+        <button class="s-btn">${svg('comment')}<span>تعليق</span></button>
+        <button class="s-btn">${svg('share')}<span>مشاركة</span></button>
       </div>
       <div class="s-info">
         <div class="s-ch"><div class="avatar sm">${esc(chInitial())}</div><b>${esc(channel())}</b>
@@ -670,7 +794,7 @@ function addShort(v) {
       <div class="s-prog"><i></i></div>`;
   feed.appendChild(s);
   loadObs.observe(s); playObs.observe(s);
-  thumbURL(v).then(u => { if (u) { $('video', s).poster = u; if (yt) s.style.background = '#000 url("' + u + '") center 35% / contain no-repeat'; } }).catch(() => {});
+  thumbURL(v).then(u => { if (u) { $('video', s).poster = u; if (yt) s.style.background = '#000 url("' + u + '") center / cover no-repeat'; } }).catch(() => {});
 }
 // ترتيب عشوائي في كل مرة تفتح Shorts (وإذا ضغطت على شورت معين يبدأ به)
 function renderShorts(firstId) {
@@ -706,10 +830,9 @@ feed.addEventListener('error', e => {
   if (e.target && e.target.tagName === 'VIDEO' && !e.target.closest('.ad') && e.target.getAttribute('src')) toast('تعذر تشغيل الفيديو');
 }, true);
 feed.addEventListener('click', e => {
-  const nb = e.target.closest('[data-nav]');
-  if (nb) { feed.scrollBy({ top: +nb.dataset.nav * feed.clientHeight, behavior: 'smooth' }); return; }
   if (e.target.closest('button')) return;
-  const s = e.target.closest('.short'); if (!s || s.classList.contains('yt')) return;
+  const s = e.target.closest('.short'); if (!s) return;
+  if (s.classList.contains('yt')) { toggleShortYt(s); return; }
   const vd = $('video', s), fl = $('.s-flash', s);
   // إذا المتصفح شغّله بدون صوت، أول ضغطة ترجع الصوت بدل الإيقاف
   if (state.muted || vd.muted) {
@@ -819,7 +942,6 @@ function setMini(on) {
 }
 function minimizeWatch() {
   if ($('#watch').hidden || W.mini) return;
-  if (W.cur && W.cur.ytId) { closeWatch(); return; } // يوتيوب ما ينصغّر، يسكّر مباشرة
   if (history.state && history.state.w) {
     W.skipPop = true; setTimeout(() => { W.skipPop = false; }, 700);
     history.back();
@@ -949,7 +1071,7 @@ $('#p-full').addEventListener('click', e => {
 document.addEventListener('fullscreenchange', () => {
   try {
     if (document.fullscreenElement) {
-      if (W.vid.videoWidth > W.vid.videoHeight && screen.orientation && screen.orientation.lock) {
+      if ((W.vid.videoWidth > W.vid.videoHeight || (W.cur && W.cur.ytId && W.cur.kind !== 'short')) && screen.orientation && screen.orientation.lock) {
         const p = screen.orientation.lock('landscape'); if (p && p.catch) p.catch(() => {});
       }
     } else if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
@@ -967,6 +1089,20 @@ seekEl.addEventListener('pointermove', e => { if (scrub) seekFrom(e); });
 const endScrub = () => { scrub = false; showCtl(); };
 seekEl.addEventListener('pointerup', endScrub);
 seekEl.addEventListener('pointercancel', endScrub);
+
+// بالشاشة الكاملة: سحب الإصبع للأسفل يطلّع من الشاشة الكاملة
+(function () {
+  let g = null;
+  W.ov.addEventListener('touchstart', e => {
+    g = (document.fullscreenElement && e.touches.length === 1 && !e.target.closest('.seek')) ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+  }, { passive: true });
+  W.ov.addEventListener('touchend', e => {
+    if (!g) return;
+    const t = e.changedTouches[0], dy = t.clientY - g.y, dx = Math.abs(t.clientX - g.x);
+    g = null;
+    if (dy > 80 && dy > dx * 1.5 && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  }, { passive: true });
+})();
 
 let lastTap = 0, tapT = null;
 W.ov.addEventListener('click', e => {
@@ -999,7 +1135,9 @@ function navIcons(t) {
 function setTab(t, opt = {}) {
   const prev = state.tab;
   if (prev === t && t === 'home' && opt.refresh !== false) {
-    homeRank.clear(); renderHome(); $('#view-home').scrollTo({ top: 0, behavior: 'smooth' });
+    reshuffleHome(); renderHome(); $('#view-home').scrollTo({ top: 0, behavior: 'smooth' });
+  } else if (t === 'home' && prev !== 'home') {
+    reshuffleHome(); renderHome(); $('#view-home').scrollTop = 0; // كل رجعة للرئيسية = ترتيب جديد
   }
   let replaced = false;
   if (t === 'shorts' && !$('#watch').hidden) {
@@ -1051,13 +1189,14 @@ document.addEventListener('click', e => {
 
 window.addEventListener('popstate', () => {
   if (W.skipPop) { W.skipPop = false; return; }
-  if (!$('#watch').hidden && !W.mini) { if (W.ad || (W.cur && W.cur.ytId)) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
+  if (!$('#watch').hidden && !W.mini) { if (W.ad) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
   else if (!$('#admin').hidden) hideAdmin();
   else if (state.tab === 'shorts') setTab('home', { fromPop: true, refresh: false }); // الرجوع من Shorts يرجع للرئيسية
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { W.vid.pause(); $$('.short video').forEach(v => v.pause()); $$('.short.yt').forEach(unmountShortYt); if (W.yt) W.yt.pause(); if (W.ad) W.ad.pause(); }
+  if (document.hidden) { homeHiddenAt = Date.now(); W.vid.pause(); $$('.short video').forEach(v => v.pause()); $$('.short.yt').forEach(unmountShortYt); if (W.yt) W.yt.pause(); if (W.ad) W.ad.pause(); }
   else {
+    if (state.tab === 'home' && $('#watch').hidden && !state.query && Date.now() - homeHiddenAt > 20000) { reshuffleHome(); renderHome(); $('#view-home').scrollTop = 0; }
     if (W.ad) W.ad.resume();
     else if (state.tab === 'shorts' && activeShort && $('#watch').hidden && !kidAd) playShort(activeShort);
   }
@@ -1324,6 +1463,22 @@ function buildAdmin() {
         <button class="ghost danger" id="bt-stop" style="margin-top:10px">إيقاف</button>
       </div>
     </section>
+    <section class="adm-card" id="adm-ytb">
+      <h3>إضافة مجموعة روابط يوتيوب</h3>
+      <div class="lbl">الصق الروابط (حتى لو كانت ملتصقة ببعض أو وسط كلام) أو اختر ملف نصي فيه الروابط. يستخرج كل رابط يبدأ بـ https ويحذف المكرر، ويجلب العنوان والصورة والمدة. دقيقة أو أقل يصير Short، وغيره فيديو طويل. الفيديو الممنوع تشغيله خارج يوتيوب يتخطاه.</div>
+      <textarea id="ytb-text" dir="ltr" rows="5" placeholder="https://youtu.be/...&#10;https://www.youtube.com/watch?v=..."></textarea>
+      <label class="filebtn"><input type="file" id="ytb-file" accept=".txt,.csv,.json,.md,.html,text/*" hidden><span id="ytb-file-name">أو اختر ملف نصي فيه الروابط</span></label>
+      <div class="cmp-note" id="ytb-found"></div>
+      <label class="chk" id="ytb-cloud-row"><input type="checkbox" id="ytb-cloud"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>
+      <button class="primary" id="ytb-go">استخراج وإضافة</button>
+      <div class="cmp" id="ytb-prog" hidden>
+        <div id="ytb-line1"></div>
+        <div class="cmp-bar" style="margin-top:8px"><i id="ytb-bar"></i></div>
+        <div class="cmp-note" id="ytb-line2"></div>
+        <div class="cmp-note">خلي الشاشة شغالة وابقى بهذي الصفحة لحد ما يخلص. يحتاج إنترنت.</div>
+        <button class="ghost danger" id="ytb-stop" style="margin-top:10px">إيقاف</button>
+      </div>
+    </section>
     <section class="adm-card">
       <h3>إضافة فيديو</h3>
       <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button><button data-v="yt">يوتيوب</button></div>
@@ -1419,6 +1574,26 @@ function buildAdmin() {
   };
   $('#bt-stop').onclick = () => { if (batch.running) { batch.cancel = true; if (batch.job && batch.job.abort) batch.job.abort(); updateBatchUI(); } };
   updateBatchUI();
+  const ytbScan = () => {
+    const t = $('#ytb-text').value, r = ytExtractAll(t);
+    $('#ytb-found').textContent = t.trim() ? `لقيت ${r.items.length} رابط يوتيوب صالح` + (r.dup ? ` • ${r.dup} مكرر` : '') + (r.bad ? ` • ${r.bad} غير صالح` : '') : '';
+  };
+  $('#ytb-text').oninput = ytbScan;
+  $('#ytb-file').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    $('#ytb-file-name').textContent = f.name;
+    try { const t = await f.text(), box = $('#ytb-text'); box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + t; ytbScan(); }
+    catch (x) { toast('تعذر قراءة الملف'); }
+  };
+  $('#ytb-cloud-row').hidden = !CL.ok;
+  $('#ytb-go').onclick = () => {
+    if (ytb.running) return;
+    const r = ytExtractAll($('#ytb-text').value);
+    if (!r.items.length) return toast('ما لقيت روابط يوتيوب');
+    runYtBatch(r, !!($('#ytb-cloud') && $('#ytb-cloud').checked));
+  };
+  $('#ytb-stop').onclick = () => { if (ytb.running) { ytb.cancel = true; updateYtbUI(); } };
+  updateYtbUI();
 
   $('#set-ch-ok').onclick = () => {
     const v = $('#set-ch').value.trim(); if (!v) return;
@@ -1602,7 +1777,7 @@ function renderAdminList() {
 
 async function onAdd() {
   if (adm.busy) return;
-  if (batch.running) return toast('الإضافة الجماعية شغالة، انتظر تخلص');
+  if (batch.running || ytb.running) return toast('الإضافة الجماعية شغالة، انتظر تخلص');
   const isYt = adm.src === 'yt';
   const isFile = adm.src === 'file';
   const url = $('#in-url').value.trim();
@@ -1792,6 +1967,85 @@ async function runBatch(files, wantCmp) {
   updateBatchUI();
   const f = $('#bt-files'); if (f) { f.value = ''; const nm = $('#bt-name'); if (nm) nm.textContent = 'اختر الفيديوهات'; }
   toast(stopMsg || (batch.cancel ? `تم الإيقاف. انضافت ${batch.ok} فيديو` : `خلصت ✓ انضافت ${batch.ok} فيديو` + (batch.orig > batch.now ? ` ووفّرنا ${fmtSize(batch.orig - batch.now)}` : '')));
+}
+
+/* ---- إضافة مجموعة روابط يوتيوب ---- */
+const ytb = { running: false, cancel: false, n: 0, done: 0, ok: 0, fail: 0, dup: 0, bad: 0, finished: false };
+function updateYtbUI() {
+  const box = $('#ytb-prog'); if (!box) return;
+  const go = $('#ytb-go'); if (go) go.disabled = ytb.running;
+  box.hidden = !ytb.running && !ytb.finished;
+  const l1 = $('#ytb-line1'), l2 = $('#ytb-line2'), bar = $('#ytb-bar'), stop = $('#ytb-stop');
+  const extra = (ytb.dup ? ` • مكرر/موجود ${ytb.dup}` : '') + (ytb.bad ? ` • غير صالح ${ytb.bad}` : '');
+  if (ytb.running) {
+    l1.textContent = ytb.cancel ? 'جاري الإيقاف…' : `جاري المعالجة: ${ytb.done} من ${ytb.n}`;
+    bar.style.width = (ytb.n ? ytb.done / ytb.n * 100 : 0) + '%';
+    l2.textContent = `تمت إضافة ${ytb.ok}` + (ytb.fail ? ` • تعذر ${ytb.fail} (ممنوع التضمين أو غير متوفر)` : '') + extra;
+    stop.hidden = false;
+  } else if (ytb.finished) {
+    l1.textContent = `خلصت: تمت إضافة ${ytb.ok} من ${ytb.n}`;
+    bar.style.width = (ytb.n ? ytb.done / ytb.n * 100 : 100) + '%';
+    l2.textContent = (ytb.fail ? `تعذر ${ytb.fail} (ممنوع التضمين أو غير متوفر)` : '') + extra;
+    stop.hidden = true;
+  }
+}
+async function runYtBatch(ex, toCloud) {
+  const have = new Set(state.all.map(v => v.ytId).filter(Boolean));
+  const items = ex.items.filter(p => !have.has(p.id));
+  Object.assign(ytb, { running: true, cancel: false, n: items.length, done: 0, ok: 0, fail: 0, dup: (ex.items.length - items.length) + ex.dup, bad: ex.bad, finished: false });
+  if (!items.length) {
+    ytb.running = false; ytb.finished = true; updateYtbUI();
+    return toast('كل هذي الروابط موجودة من قبل');
+  }
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  let wake = null; try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+  const used = new Set(state.all.map(v => v.title));
+  const pending = {};
+  let next = 0, sinceRefresh = 0, stopMsg = '';
+  const flush = async () => {
+    const keys = Object.keys(pending); if (!keys.length) return;
+    const o = {}; keys.forEach(k => { o[k] = pending[k]; delete pending[k]; });
+    try { await withTimeout(CL.db.ref('videos').update(o)); }
+    catch (e) { ytb.ok -= keys.length; ytb.fail += keys.length; stopMsg = 'تعذر الحفظ بالسحابة'; }
+  };
+  const refresh = async () => { await loadVideos(); refreshAll(); renderAdminList(); };
+  updateYtbUI();
+  const work = async () => {
+    while (!ytb.cancel) {
+      const i = next++; if (i >= items.length) break;
+      const p = items[i];
+      const m = await ytMeta(p.id);
+      if (ytb.cancel) break;
+      if (m.err) { ytb.fail++; ytb.done++; updateYtbUI(); continue; }
+      const thumbUrl = await ytThumb(p.id);
+      let title = (m.title || '').replace(/\s+/g, ' ').trim();
+      if (!title) title = await ytTitle(p.id);
+      title = (title || '').slice(0, 140);
+      if (!title) title = kidTitle(used); else used.add(title);
+      const dur = Math.round(m.dur || 0);
+      const meta = {
+        id: uid(), title, kind: dur ? (dur <= 60 ? 'short' : 'long') : (p.short ? 'short' : 'long'),
+        src: 'yt', url: 'https://www.youtube.com/watch?v=' + p.id, ytId: p.id, hasBlob: false,
+        thumbUrl, hasThumb: false, duration: dur, created: Date.now() + i, size: 0
+      };
+      try {
+        if (toCloud) { pending[meta.id] = meta; ytb.ok++; if (Object.keys(pending).length >= 10) await flush(); }
+        else { await saveVideo(meta, {}); ytb.ok++; if (++sinceRefresh >= 5) { sinceRefresh = 0; await refresh(); } }
+      } catch (e) {
+        console.error(e); ytb.fail++;
+        if (e && e.name === 'QuotaExceededError') { stopMsg = 'مساحة الهاتف ممتلئة، توقفت الإضافة'; ytb.cancel = true; }
+      }
+      ytb.done++; updateYtbUI();
+    }
+  };
+  try { await Promise.all(Array.from({ length: Math.min(3, items.length) }, work)); }
+  catch (e) { console.error(e); stopMsg = 'صار خطأ وتوقفت الإضافة'; }
+  try { await flush(); await refresh(); } catch (e) {}
+  if (wake) wake.release().catch(() => {});
+  ytb.running = false; ytb.finished = true;
+  updateYtbUI();
+  if (!ytb.cancel || stopMsg) { const t = $('#ytb-text'); if (t && !stopMsg) { t.value = ''; const fd = $('#ytb-found'); if (fd) fd.textContent = ''; } }
+  toast(stopMsg || (ytb.cancel ? `تم الإيقاف. انضافت ${ytb.ok} فيديو` : `خلصت ✓ انضافت ${ytb.ok} فيديو يوتيوب` + (ytb.fail ? ` وتعذر ${ytb.fail}` : '')));
 }
 
 /* ---- الدخول: ضغطة مطولة على الشعار ---- */

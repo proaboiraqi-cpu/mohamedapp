@@ -313,17 +313,21 @@ h1,h2,h3,h4,p{margin:0}
 .cmp-note{color:var(--text2);font-size:12px;margin-top:6px;line-height:1.5}
 
 /* ---------- مشغل يوتيوب (داخل sandbox) ---------- */
-.yt-bar{display:none}
-#watch.yt .yt-bar{display:flex;flex:none;height:40px;align-items:center;padding:0 4px;background:var(--bg)}
-#watch.yt.mini .yt-bar{display:none}
-#watch.yt #vid,#watch.yt .p-overlay,#watch.yt #p-spin,#watch.yt #p-skip{display:none}
-#watch.yt .player{touch-action:auto}
-.yt-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
-@media (orientation:landscape) and (max-height:520px){#watch.yt .yt-bar{display:none}}
-/* Shorts يوتيوب: المشغل بالأعلى بدون أي شي فوقه، والأزرار والمعلومات بشريط تحته */
-.short.yt video,.short.yt .s-shade,.short.yt .s-prog,.short.yt .s-flash{display:none}
-.short.yt .yt-frame.sh{inset:auto;top:0;left:0;width:100%;height:calc(100% - 136px)}
-.short.yt .s-actions{left:0;right:0;bottom:0;height:62px;flex-direction:row;justify-content:space-around;align-items:center;gap:0}
-.short.yt .s-info{left:12px;right:12px;bottom:66px}
-.short.yt .s-info p{margin-top:6px;-webkit-line-clamp:1}
-.s-btn.up svg{transform:rotate(180deg)}
+.yt-bar{display:none!important}
+.yt-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;pointer-events:none}
+#watch.yt #vid{display:none}
+#watch.yt:not(.mini) .p-overlay,#watch.yt:not(.mini) #p-spin,#watch.yt:not(.mini) #p-skip{display:block}
+#watch.yt .player{touch-action:none}
+#watch.yt.mini .p-overlay{display:block;background:none}
+#watch.yt.mini .p-overlay>*{display:none}
+#watch.yt.mini #p-spin,#watch.yt.mini #p-skip{display:none}
+.yt-tap{position:absolute;inset:0}
+.short.yt video{display:none}
+.short.yt .yt-frame.sh{inset:auto;left:50%;top:50%;width:auto;height:100%;aspect-ratio:9/16;transform:translate(-50%,-50%)}
+.short.yt .s-shade,.short.yt .s-prog{display:block}
+.short.yt .s-flash{display:grid}
+.short.yt .s-actions{left:6px;right:auto;bottom:64px;top:auto;height:auto;flex-direction:column;justify-content:flex-start;align-items:center;gap:16px}
+.short.yt .s-info{left:84px;right:12px;bottom:16px}
+.short.yt .s-info p{margin-top:10px;-webkit-line-clamp:2}
+.adm-card textarea{width:100%;background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin:6px 0;outline:none;font:13px/1.5 monospace;color:var(--text);resize:vertical;-webkit-user-select:text;user-select:text}
+.adm-card textarea:focus{border-color:var(--blue)}
