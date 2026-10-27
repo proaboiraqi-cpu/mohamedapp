@@ -328,9 +328,10 @@ function ytParse(input) {
 function ytURL(id, o) {
   const q = new URLSearchParams({
     autoplay: o.autoplay ? '1' : '0', controls: o.controls ? '1' : '0', fs: o.controls ? '1' : '0',
-    rel: '0', loop: '1', playlist: id, playsinline: '1', iv_load_policy: '3', disablekb: '1',
+    rel: '0', playsinline: '1', iv_load_policy: '3', disablekb: '1',
     modestbranding: '1', enablejsapi: '1', hl: 'ar', cc_load_policy: '0'
   });
+  if (!o.noLoop) { q.set('loop', '1'); q.set('playlist', id); }
   if (/^https?:/.test(location.origin)) q.set('origin', location.origin);
   return 'https://www.youtube-nocookie.com/embed/' + id + '?' + q.toString();
 }
@@ -369,7 +370,7 @@ function ytAttach(frame, h) {
     c.p = new YT.Player(frame, { events: {
       onReady: () => { if (h && h.onReady) h.onReady(); },
       onStateChange: e => {
-        if (e.data === 0) { try { c.p.seekTo(0, true); c.p.playVideo(); } catch (x) {} }
+        if (e.data === 0 && !(h && h.noLoop)) { try { c.p.seekTo(0, true); c.p.playVideo(); } catch (x) {} }
         if (h && h.onState) h.onState(e.data);
       },
       onError: e => { if (h && h.onError) h.onError(e.data); }
@@ -639,9 +640,10 @@ function runAd(box, ad, opt = {}) {
   const vd = $('video', el), skipBtn = $('.ad-skip', el), left = $('.ad-left', el), bar = $('.ad-prog i', el);
   const ctl = { done: false, res: null };
   const skipAfter = +ad.skip || 0;
-  let guard, counted = false;
+  let guard, counted = false, finishYt = null;
   const cleanup = () => {
     ctl.done = true; clearTimeout(guard);
+    if (finishYt) { try { finishYt(); } catch (e) {} }
     try { vd.pause(); vd.removeAttribute('src'); vd.load(); } catch (e) {}
     if (ctl.res && ctl.res.obj) URL.revokeObjectURL(ctl.res.url);
     el.remove();
@@ -670,6 +672,40 @@ function runAd(box, ad, opt = {}) {
   });
   skipBtn.onclick = e => { e.stopPropagation(); if (!skipBtn.disabled) finish(); };
   if (opt.onBack) $('.ad-back', el).onclick = e => { e.stopPropagation(); opt.onBack(); };
+  if (ad.ytId) {
+    // إعلان من يوتيوب: نفس شكل الإعلان، والمشغل محمي ما يطلع منه
+    el.classList.add('isyt');
+    const fr = ytFrame(ad.ytId, { autoplay: true, controls: false, noLoop: true });
+    el.insertBefore(fr, el.firstChild);
+    let iv = 0;
+    const yc = ytAttach(fr, {
+      noLoop: true,
+      onReady: () => { try { if (opt.muted && yc.p) yc.p.mute(); } catch (e) {} yc.play(); },
+      onState: st => {
+        if (st === 1) { clearTimeout(guard); if (!counted) { counted = true; if (!opt.preview) adLogAdd(ad.id); } }
+        if (st === 0) finish();
+      },
+      onError: () => finish()
+    });
+    const ytTick = () => {
+      const d = yc.getDur(), t = yc.getTime();
+      if (d) { left.textContent = fmtDur(Math.max(0, d - t)); bar.style.width = Math.min(100, t / d * 100) + '%'; }
+      if (skipAfter > 0) {
+        const rem = Math.ceil(skipAfter - t);
+        skipBtn.hidden = false; skipBtn.disabled = rem > 0;
+        skipBtn.classList.toggle('ready', rem <= 0);
+        skipBtn.textContent = rem > 0 ? 'تخطي بعد ' + rem : 'تخطي';
+      }
+    };
+    const baseClean = cleanup;
+    ctl.kill = () => { if (!ctl.done) { clearInterval(iv); yc.kill(); baseClean(); } };
+    ctl.pause = () => { if (!ctl.done) yc.pause(); };
+    ctl.resume = () => { if (!ctl.done) yc.play(); };
+    finishYt = () => { clearInterval(iv); yc.kill(); };
+    iv = setInterval(ytTick, 400); ytTick();
+    guard = setTimeout(finish, 15000); // إذا ما اشتغل، يكمل الفيديو عادي
+    return ctl;
+  }
   tick();
   (async () => {
     let r;
@@ -1450,6 +1486,34 @@ function closeAdmin() {
 function setStatus(t) { const s = $('#adm-status'); if (s) s.textContent = t || ''; }
 function setSeg(id, v) { $$(`${id} button`).forEach(b => b.classList.toggle('on', b.dataset.v === v)); }
 
+// تقسيم لوحة التحكم على أقسام (تبويبات)
+const ADM_PANES = [
+  ['pub', '📤', 'النشر', ['#adm-batch', '#adm-ytb', '#adm-single']],
+  ['vids', '🎬', 'فيديوهاتي', ['#adm-vids']],
+  ['game', '🎮', 'اللعبة', ['#adm-learn', '#adm-gform', '#adm-games']],
+  ['ads', '📢', 'الإعلانات', ['#adm-adsform', '#adm-adslist']],
+  ['kid', '👶', 'جهاز الطفل', ['#adm-ctl']],
+  ['set', '⚙️', 'الإعدادات', ['#adm-set']]
+];
+function admTabs(el) {
+  const body = $('.adm-body', el);
+  const bar = document.createElement('div'); bar.className = 'adm-tabs';
+  bar.innerHTML = ADM_PANES.map(([k, ic, t]) => `<button class="adm-tab" data-p="${k}"><b>${ic}</b><span>${t}</span></button>`).join('');
+  body.parentNode.insertBefore(bar, body);
+  ADM_PANES.forEach(([k, , , secs]) => {
+    const pane = document.createElement('div'); pane.className = 'adm-pane'; pane.dataset.p = k;
+    secs.forEach(q => { const n = $(q, body); if (n) pane.appendChild(n); });
+    body.appendChild(pane);
+  });
+  const show = k => {
+    if (!ADM_PANES.some(x => x[0] === k)) k = 'pub';
+    $$('.adm-tab', bar).forEach(b => b.classList.toggle('on', b.dataset.p === k));
+    $$('.adm-pane', body).forEach(pn => { pn.hidden = pn.dataset.p !== k; });
+    body.scrollTop = 0; LS.set('admtab', k);
+  };
+  bar.onclick = e => { const b = e.target.closest('.adm-tab'); if (b) show(b.dataset.p); };
+  show(LS.get('admtab', 'pub'));
+}
 function buildAdmin() {
   resetAdm();
   const el = $('#admin');
@@ -1490,8 +1554,8 @@ function buildAdmin() {
         <button class="ghost danger" id="ytb-stop" style="margin-top:10px">إيقاف</button>
       </div>
     </section>
-    <section class="adm-card">
-      <h3>إضافة فيديو</h3>
+    <section class="adm-card" id="adm-single">
+      <h3>إضافة فيديو واحد</h3>
       <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button><button data-v="yt">يوتيوب</button></div>
       <div id="src-file"><label class="filebtn"><input type="file" id="in-file" accept="video/*" hidden><span id="in-file-name">اختر فيديو</span></label></div>
       <div id="src-url" hidden>
@@ -1517,10 +1581,10 @@ function buildAdmin() {
       <div class="cmp" id="adm-cmp" hidden><div class="cmp-bar"><i id="adm-cmp-bar"></i></div>
         <div class="cmp-note">الضغط ياخذ نفس طول الفيديو تقريباً. خلي الشاشة شغالة ولا تطلع من الصفحة.</div></div>
     </section>
-    <section class="adm-card"><h3 id="adm-count">الفيديوهات</h3><div id="adm-list"></div></section>
+    <section class="adm-card" id="adm-vids"><h3 id="adm-count">الفيديوهات</h3><div id="adm-list"></div></section>
     <section class="adm-card" id="adm-adsform"></section>
     <section class="adm-card" id="adm-adslist"></section>
-    <section class="adm-card">
+    <section class="adm-card" id="adm-set">
       <h3>الإعدادات</h3>
       <div class="lbl">اسم القناة (يظهر تحت الفيديوهات)</div>
       <div class="row2"><input id="set-ch" type="text" value="${esc(channel())}"><button class="ghost" id="set-ch-ok">حفظ</button></div>
@@ -1531,6 +1595,7 @@ function buildAdmin() {
     </section>
   </div>`;
   injectIcons(el);
+  admTabs(el);
   renderAdminList();
   buildAdsAdmin(); renderAdsList(); buildCtl(); buildLearnAdmin();
 
@@ -1628,15 +1693,21 @@ let adf = {};
 function buildAdsAdmin() {
   adf = { src: 'file', file: null, skip: 5, target: 'all', perHour: 2, busy: false };
   const box = $('#adm-adsform'); if (!box) return;
+  const ytVids = state.all.filter(v => v.ytId);
   const vids = state.all.length
     ? state.all.map(v => `<label class="chk"><input type="checkbox" value="${v.id}"><span>${esc(v.title)}</span></label>`).join('')
     : '<div class="muted">ما أضفت فيديوهات بعد</div>';
   box.innerHTML = `<h3>إضافة إعلان</h3>
     <div class="lbl">الإعلان يطلع قبل الفيديو (حتى لو الفيديو أقل من دقيقة)</div>
-    <div class="seg" id="seg-ad-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button></div>
+    <div class="seg" id="seg-ad-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button><button data-v="yt">يوتيوب</button></div>
     <div id="ad-src-file"><label class="filebtn"><input type="file" id="ad-file" accept="video/*" hidden><span id="ad-file-name">اختر فيديو الإعلان</span></label></div>
     <div id="ad-src-url" hidden><input id="ad-url" type="url" dir="ltr" placeholder="https://..." autocomplete="off">
       ${CL.ok ? '<label class="chk"><input type="checkbox" id="ad-cloud"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>' : ''}</div>
+    <div id="ad-src-yt" hidden>
+      <input id="ad-yt" type="url" dir="ltr" placeholder="الصق رابط فيديو يوتيوب" autocomplete="off">
+      ${ytVids.length ? `<div class="lbl">أو اختر من فيديوهات اليوتيوب اللي نشرتها:</div><select id="ad-ytpick"><option value="">— اختر —</option>${ytVids.map(v => `<option value="${esc(v.ytId)}">${esc(v.title)}</option>`).join('')}</select>` : ''}
+      ${CL.ok ? '<label class="chk"><input type="checkbox" id="ad-cloud-yt" checked><span>مشاركة بالسحابة (يظهر على جهاز الطفل)</span></label>' : ''}
+      <div class="lbl">يحتاج إنترنت. الإعلان يشتغل بمشغل محمي، والطفل ما يقدر يطلع منه ليوتيوب.</div></div>
     <input id="ad-title" type="text" placeholder="اسم الإعلان" autocomplete="off">
     <input id="ad-adv" type="text" placeholder="اسم المعلن (مثلاً: وقت النوم)" autocomplete="off">
     <input id="ad-desc" type="text" placeholder="تفاصيل قصيرة تظهر مع الإعلان" autocomplete="off">
@@ -1656,7 +1727,13 @@ function buildAdsAdmin() {
     const b = e.target.closest('button'); if (!b) return;
     setSeg(id, b.dataset.v); cb(b.dataset.v);
   });
-  seg('#seg-ad-src', v => { adf.src = v; $('#ad-src-file').hidden = v !== 'file'; $('#ad-src-url').hidden = v !== 'url'; });
+  seg('#seg-ad-src', v => { adf.src = v; $('#ad-src-file').hidden = v !== 'file'; $('#ad-src-url').hidden = v !== 'url'; $('#ad-src-yt').hidden = v !== 'yt'; });
+  const pick = $('#ad-ytpick');
+  if (pick) pick.onchange = () => {
+    const v = state.all.find(x => x.ytId === pick.value); if (!v) return;
+    $('#ad-yt').value = 'https://youtu.be/' + v.ytId;
+    if (!$('#ad-title').value) $('#ad-title').value = v.title || '';
+  };
   seg('#seg-ad-skip', v => { adf.skip = +v; });
   seg('#seg-ad-target', v => { adf.target = v; $('#ad-vids').hidden = v !== 'videos'; });
   seg('#seg-ad-freq', v => { adf.perHour = +v; });
@@ -1671,9 +1748,15 @@ function buildAdsAdmin() {
 
 async function onAddAd() {
   if (adf.busy) return;
-  const isFile = adf.src === 'file', url = $('#ad-url').value.trim(), title = $('#ad-title').value.trim();
+  const isFile = adf.src === 'file', isYt = adf.src === 'yt', url = $('#ad-url').value.trim();
+  let title = $('#ad-title').value.trim(), ytId = '';
   if (isFile && !adf.file) return toast('اختر فيديو الإعلان أولاً');
-  if (!isFile && !/^https?:\/\//i.test(url)) return toast('اكتب رابط صحيح');
+  if (isYt) {
+    const pp = ytParse($('#ad-yt').value.trim());
+    if (!pp) return toast('الصق رابط يوتيوب صحيح أو اختر فيديو');
+    ytId = pp.id;
+    if (!title) { const v = state.all.find(x => x.ytId === ytId); title = (v && v.title) || 'إعلان'; }
+  } else if (!isFile && !/^https?:\/\//i.test(url)) return toast('اكتب رابط صحيح');
   if (!title) return toast('اكتب اسم الإعلان');
   let ids = [];
   if (adf.target === 'videos') {
@@ -1686,12 +1769,13 @@ async function onAddAd() {
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     const ad = {
       id: uid(), title, advertiser: $('#ad-adv').value.trim(), desc: $('#ad-desc').value.trim(), cta: $('#ad-cta').value.trim(),
-      src: isFile ? 'file' : 'url', url: isFile ? '' : url, hasBlob: isFile, size: isFile ? adf.file.size : 0,
+      src: isYt ? 'yt' : (isFile ? 'file' : 'url'), url: (isFile || isYt) ? '' : url, ytId, hasBlob: isFile, size: isFile ? adf.file.size : 0,
       skip: adf.skip, target: adf.target, videoIds: ids,
       useTime: $('#ad-usetime').checked, from: $('#ad-from').value || '20:00', to: $('#ad-to').value || '23:00',
       perHour: adf.perHour, enabled: true, created: Date.now()
     };
-    if (!isFile && CL.ok && $('#ad-cloud') && $('#ad-cloud').checked) {
+    const toCloud = CL.ok && (isYt ? ($('#ad-cloud-yt') && $('#ad-cloud-yt').checked) : (!isFile && $('#ad-cloud') && $('#ad-cloud').checked));
+    if (toCloud) {
       await withTimeout(CL.db.ref('ads/' + ad.id).set(ad));
     } else {
       const tx = db.transaction(['ads', 'blobs'], 'readwrite');
@@ -1723,7 +1807,7 @@ function renderAdsList() {
   box.innerHTML = `<h3>الإعلانات (${state.ads.length})</h3>` + (state.ads.length ? state.ads.map(a => `
     <div class="adrow${a.enabled === false ? ' off' : ''}" data-ad="${a.id}">
       <b>${esc(a.title)}</b>
-      <small>${esc(adSummary(a))}${a.hasBlob ? ' • على الهاتف ' + fmtSize(a.size) : (a.cloud ? ' • سحابة' : ' • رابط')}</small>
+      <small>${esc(adSummary(a))}${a.hasBlob ? ' • على الهاتف ' + fmtSize(a.size) : (a.ytId ? ' • يوتيوب' : '') + (a.cloud ? ' • سحابة' : (a.ytId ? '' : ' • رابط'))}</small>
       <div class="adact">
         <button class="ghost" data-a="prev">معاينة</button>
         <button class="ghost" data-a="tog">${a.enabled === false ? 'تشغيل' : 'إيقاف'}</button>
@@ -2292,20 +2376,21 @@ function runGate(v, forced) {
         busy = true; phase = 'win'; hand.hidden = true;
         rBtn.classList.remove('hint'); rBtn.classList.add('ok'); wBtn.classList.add('dim');
         if (!forced) lnMark(g.id, nWrong === 0);
-        setKid('happy'); say(right.name || '');
-        // يسمع اسم الشيء الصح مرتين قبل الفرح
-        for (let i = 0; i < 2 && !done; i++) { await lnSay(right.voice, right.name); if (!done) await lnWait(250); }
-        if (!done) party();
+        party();
       } else {
-        busy = true; nWrong++;
+        busy = true; nWrong++; hand.hidden = true; rBtn.classList.remove('hint');
         b.classList.remove('shake', 'no'); void b.offsetWidth; b.classList.add('shake', 'no');
-        later(() => b.classList.remove('no'), 1600);
-        lnBoop();
-        await lnSay(wrong.voice, wrong.name);
+        setKid('angry');
+        const wt = `هذا ${wrong.name || ''}، مو ${right.name || ''}`;
+        say(wt);
+        await lnSay(wrong.voice, wt);
         if (done) return;
+        await lnWait(400);
+        if (done) return;
+        b.classList.remove('no');
         if (c.maxWrong > 0 && nWrong >= c.maxWrong) { lose(); return; }
-        busy = false;
-        showHand(); say(askText); askVoice();
+        busy = false; lastAct = Date.now();
+        setKid('point'); say(askText); askVoice(); armHint(3500);
       }
     });
 
@@ -2329,7 +2414,10 @@ function runGate(v, forced) {
       say(t);
       const foods = ['🍫', '🍉', '🍬', '🧃', '🍪', '🍰', '🍭', '🍩', '🍚', '🍲', '🍎', '🍌'];
       const p = document.createElement('div'); p.className = 'g-conf-w';
-      p.innerHTML = Array.from({ length: 16 }, (_, i) => `<i class="g-conf ga" style="left:${(i % 8) * 12 + 3}%;animation-delay:${(i >= 8 ? 1.2 : 0) + ((i * 3) % 8) * 0.1}s">${foods[(i * 5) % foods.length]}</i>`).join('');
+      p.innerHTML = Array.from({ length: 20 }, (_, i) => {
+        const col = i % 10, wave = i >= 10 ? 1 : 0;
+        return `<i class="g-conf ga" style="left:${col * 9.6 + 1}%;--h:-${58 + ((i * 37) % 30)}vh;--r:${(i % 2 ? 1 : -1) * (20 + (i * 13) % 40)}deg;animation-delay:${wave * 1.5 + ((i * 3) % 10) * 0.07}s">${foods[(i * 5) % foods.length]}</i>`;
+      }).join('');
       root.appendChild(p);
       lnChime();
       setKid('clap');
@@ -2337,7 +2425,7 @@ function runGate(v, forced) {
       swIv = setInterval(() => { if (done || phase !== 'party') { clearInterval(swIv); return; } setKid(++k % 2 ? 'happy' : 'clap'); }, 850);
       sayNow = () => lnSay(c.praise, t);
       later(() => { if (phase === 'party') sayNow(); }, 450);
-      later(() => { clearInterval(swIv); p.remove(); if (rw) reward(rw); else finish('won'); }, 4300);
+      later(() => { clearInterval(swIv); p.remove(); if (rw) reward(rw); else finish('won'); }, 4800);
     };
 
     /* ---- 3) الجائزة: محمد ياكل + الولد يأشر على الجائزة + الفيديو تحت ---- */
@@ -2345,9 +2433,9 @@ function runGate(v, forced) {
       phase = 'reward'; root.classList.add('rwd');
       const t = (r.text || '').trim() || 'روح جيب الجائزة!';
       say(t); setKid('eat');
-      const main = r.prize || r.place, inset = r.prize && r.place ? r.place : '';
+      const main = r.place || r.prize, inset = r.prize && r.place ? r.prize : '';
       stage.innerHTML = `<div class="g-rwm"><img class="g-pt" alt="" src="${KIDIMG.point}">
-        <div class="g-prz"><img class="g-prz-i" alt="" src="${main}">${inset ? `<span class="g-plc"><img alt="" src="${inset}"><i>📍</i></span>` : ''}<span class="g-rwar"><span class="ga">${G_ARROW}</span></span></div></div>`;
+        <div class="g-prz"><img class="g-prz-i" alt="" src="${main}">${r.place ? '<i class="g-pin">📍</i>' : ''}${inset ? `<span class="g-plc"><img alt="" src="${inset}"></span>` : ''}<span class="g-rwar"><span class="ga">${G_ARROW}</span></span></div></div>`;
       sayNow = () => lnSay(r.voice, t);
       $('.g-prz', stage).onclick = () => { stopSound(); sayNow(); };
       const t0 = Date.now();
@@ -2522,8 +2610,8 @@ function buildLearnAdmin() {
   };
 
   const ask = recField($('#gf-ask'), 'صوتك وأنت تسأل (مثل: «يلا محمد، وين الماي؟»)');
-  const rIm = imgField($('#gf-rimg'), 'صورة الشيء الصحيح'), rV = recField($('#gf-rvoice'), 'صوتك وأنت تقول اسمه (مثل: «ماي ماي»)');
-  const wIm = imgField($('#gf-wimg'), 'صورة الشيء الخطأ'), wV = recField($('#gf-wvoice'), 'صوتك وأنت تقول اسمه (مثل: «حليب حليب»)');
+  const rIm = imgField($('#gf-rimg'), 'صورة الشيء الصحيح'), rV = recField($('#gf-rvoice'), 'صوتك تقول اسمه «ماي» (اختياري: يسمعه إذا غلط كثير أو تأخر)');
+  const wIm = imgField($('#gf-wimg'), 'صورة الشيء الخطأ'), wV = recField($('#gf-wvoice'), 'صوتك لما يغلط (مثل: «هذا حليب، مو ماي»)');
   const pPlace = imgField($('#gf-place'), 'صورة المكان (مثلاً الثلاجة)'), pPrize = imgField($('#gf-prize'), 'صورة الجائزة (مثلاً الجيلاتين)'), pV = recField($('#gf-rwvoice'), 'صوتك (مثل: «روح للثلاجة، اكو جيلاتين»)');
   let editId = null;
   const rwChk = $('#gf-rw');
@@ -2614,7 +2702,7 @@ const GATE_CSS = `
 .g-opt.no .g-badge{display:grid;background:#ff5a5a}.g-opt.no .g-badge::after{content:'✕'}
 .g-hand{position:absolute;font-size:66px;line-height:1;pointer-events:none;z-index:3;filter:drop-shadow(0 4px 4px rgba(0,0,0,.25))}
 .g-conf-w{position:absolute;inset:0;pointer-events:none;z-index:6;overflow:hidden}
-.g-conf{position:absolute;top:-70px;font-style:normal;line-height:1;font-size:40px}
+.g-conf{position:absolute;top:100%;font-style:normal;line-height:1;font-size:42px}
 .g-rw{display:flex;flex-direction:column;align-items:center;gap:4px;width:100%;flex:1;min-height:0}
 .g-rwc{flex:1;min-height:0;width:100%;display:flex;justify-content:center}
 .g-sq{height:100%;aspect-ratio:1;max-width:100%;background:#fff;border-radius:28px;padding:8px;box-shadow:var(--sh);display:block;box-sizing:border-box}
@@ -2645,7 +2733,7 @@ const GATE_CSS = `
 #gate#gate .g-opt.shake{animation:gshake .45s!important}
 #gate#gate .g-opt.ok{animation:gwin .6s ease-out!important}
 #gate#gate .g-hand.ga{animation:gtap .9s ease-in-out infinite!important}
-#gate#gate .g-conf.ga{animation:gfall 2.7s ease-in both!important}
+#gate#gate .g-conf.ga{animation:gburst 2.9s cubic-bezier(.25,.6,.4,1) both!important}
 #gate#gate .g-arrow .ga{animation:garrow 1s ease-in-out infinite!important}
 #gate#gate .g-play.ga{animation:gpulse2 1.2s ease-in-out infinite!important}
 @keyframes gbob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
@@ -2656,17 +2744,17 @@ const GATE_CSS = `
 @keyframes gwin{0%{transform:scale(1)}50%{transform:scale(1.06)}100%{transform:scale(1)}}
 @keyframes gshake{20%{transform:translateX(-10px)}40%{transform:translateX(10px)}60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
 @keyframes gtap{0%,100%{transform:translateY(0)}50%{transform:translateY(-20px)}}
-@keyframes gfall{0%{transform:translateY(0) rotate(-15deg)}100%{transform:translateY(125vh) rotate(25deg)}}
+@keyframes gburst{0%{transform:translateY(0) rotate(0)}45%{transform:translateY(var(--h)) rotate(var(--r))}100%{transform:translateY(20px) rotate(calc(var(--r) * 2))}}
 @keyframes garrow{0%,100%{transform:translateY(-4px)}50%{transform:translateY(6px)}}
 .gate.rwd .g-head{height:clamp(150px,30vh,270px)}
 .g-kid.eat{border-radius:22px;border:5px solid #fff;box-shadow:0 8px 20px rgba(30,60,120,.25);filter:none;box-sizing:border-box}
 .g-rwm{flex:1;min-height:0;width:100%;max-width:620px;display:flex;direction:ltr;align-items:flex-end;justify-content:center}
 .g-pt{height:88%;width:auto;flex:none;margin-right:-22px;position:relative;z-index:2;filter:drop-shadow(0 6px 5px rgba(0,0,0,.18))}
-.g-prz{position:relative;height:100%;aspect-ratio:1;max-width:calc(100% - 100px);align-self:center;background:#fff;border-radius:30px;padding:8px;box-sizing:border-box;box-shadow:0 0 0 6px #ffd43b,0 7px 0 #e0b200,0 0 44px #ffe066}
+.g-prz{position:relative;height:100%;aspect-ratio:1;max-width:calc(100% - 100px);align-self:center;background:#fff;border-radius:30px;padding:8px;box-sizing:border-box;box-shadow:0 0 0 6px #3ea6ff,0 7px 0 #1f7fd1,0 12px 26px rgba(30,60,120,.2)}
+.g-pin{position:absolute;top:-16px;right:12px;font-size:40px;font-style:normal;z-index:3;filter:drop-shadow(0 3px 3px rgba(0,0,0,.3))}
 .g-prz-i{width:100%;height:100%;object-fit:cover;border-radius:22px;display:block}
-.g-plc{position:absolute;right:-10px;bottom:-12px;width:38%;aspect-ratio:1;border-radius:18px;border:4px solid #fff;overflow:hidden;box-shadow:0 6px 14px rgba(0,0,0,.25);background:#fff}
+.g-plc{position:absolute;right:-12px;bottom:-14px;width:44%;aspect-ratio:1;border-radius:20px;border:5px solid #ffd43b;overflow:hidden;box-shadow:0 0 0 3px #fff,0 0 26px #ffe066,0 6px 14px rgba(0,0,0,.25);background:#fff;z-index:2}
 .g-plc img{width:100%;height:100%;object-fit:cover;display:block}
-.g-plc i{position:absolute;top:2px;left:4px;font-size:26px;font-style:normal}
 .g-rwar{position:absolute;left:-30px;top:40%;width:46px;height:46px;color:#ff9f1c;z-index:3;transform:rotate(-90deg)}
 .g-rwar span{display:block;width:100%;height:100%}.g-rwar svg{width:100%;height:100%;display:block;filter:drop-shadow(0 3px 0 #d97a00)}
 .g-ytw{position:relative;flex:none;width:100%;max-width:620px;margin-top:14px}
@@ -2686,6 +2774,12 @@ const GATE_CSS = `
 #gate#gate .g-rwar .ga{animation:garrow 1s ease-in-out infinite!important}
 #gate#gate .g-ytw{animation:gpop .45s ease-out!important}
 @keyframes geat{0%,100%{transform:rotate(-2deg) scale(1)}50%{transform:rotate(2deg) scale(1.05)}}
+.adm-tabs{flex:none;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
+.adm-tab{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 4px;border-radius:12px;background:var(--bg3);border:1px solid var(--line);font-size:13px;color:var(--text);font-family:inherit}
+.adm-tab b{font-size:20px;line-height:1.1}
+.adm-tab.on{background:#e8f2ff;border-color:var(--blue);color:var(--blue);font-weight:700}
+.adm-pane[hidden]{display:none}
+.ad.isyt video{display:none}
 .rec{margin:6px 0}.rec-b{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
 .rec-img{width:110px;height:110px;object-fit:cover;border-radius:14px;margin-top:6px;display:block}
 .rec-img[hidden]{display:none}
@@ -2789,7 +2883,7 @@ function applyCtl() {
 }
 function handlePush() {
   const p = state.ctl && state.ctl.push;
-  if (!KID() || !p || !p.id || !p.url || p.id === LS.get('lastpush', '')) return;
+  if (!KID() || !p || !p.id || !(p.url || p.ytId) || p.id === LS.get('lastpush', '')) return;
   if (p.ts && (CL.now() - p.ts) / 1000 > 180) return; // أمر قديم، لا نعرضه
   LS.set('lastpush', p.id);
   showKidAd(p);
@@ -2809,7 +2903,7 @@ function showKidAd(p) {
   if (ytW) W.yt.pause();
   W.vid.pause(); $$('.short video').forEach(v => v.pause());
   if (siteAd) siteAd.pause();
-  const ad = { id: 'push-' + p.id, title: p.title || 'إعلان', advertiser: p.advertiser || '', desc: p.desc || '', url: p.url, skip: +p.skip || 0, noCta: true };
+  const ad = { id: 'push-' + p.id, title: p.title || 'إعلان', advertiser: p.advertiser || '', desc: p.desc || '', url: p.url || '', ytId: p.ytId || '', skip: +p.skip || 0, noCta: true };
   const ctl = runAd(box, ad, {
     preview: true, muted: false,
     onEnd: () => {
@@ -2833,9 +2927,13 @@ function updCtlStatus() {
 }
 function cloudOptions() {
   const vids = state.cloud.filter(v => !v.ytId).sort((a, b) => b.created - a.created);
+  const yts = state.all.filter(v => v.ytId);
   const ads = state.cloudAds;
-  return vids.map(v => `<option value="v:${esc(v.id)}">${esc(v.title)}</option>`).join('')
-    + ads.map(a => `<option value="a:${esc(a.id)}">إعلان: ${esc(a.title)}</option>`).join('');
+  const grp = (label, html) => html ? `<optgroup label="${label}">${html}</optgroup>` : '';
+  return '<option value="">— اختر —</option>'
+    + grp('فيديوهات يوتيوب', yts.map(v => `<option value="y:${esc(v.id)}">${esc(v.title)}</option>`).join(''))
+    + grp('فيديوهات السحابة', vids.map(v => `<option value="v:${esc(v.id)}">${esc(v.title)}</option>`).join(''))
+    + grp('الإعلانات', ads.map(a => `<option value="a:${esc(a.id)}">${esc(a.title)}</option>`).join(''));
 }
 function refreshCtlLists() {
   const sel = $('#ctl-vid'), only = $('#ctl-only');
@@ -2866,8 +2964,9 @@ function buildCtl() {
     <div class="lbl">شنو يشوف الطفل؟</div>
     <div class="seg" id="seg-mode"><button data-v="all">كل المحتوى</button><button data-v="only">محتوى محدد</button><button data-v="locked">إيقاف الموقع</button></div>
     <div id="ctl-only" class="vidpick" hidden></div>
-    <div class="lbl">إرسال فيديو كإعلان للطفل الآن</div>
+    <div class="lbl">إرسال إعلان لجهاز الطفل الآن (يطلع على الشاشة كاملة)</div>
     <select id="ctl-vid">${cloudOptions()}</select>
+    <input id="ctl-yt" type="url" dir="ltr" placeholder="أو الصق رابط يوتيوب جديد" autocomplete="off">
     <input id="ctl-title" type="text" placeholder="عنوان يظهر مع الإعلان (اختياري)" autocomplete="off">
     <div class="lbl">زر التخطي</div>
     <div class="seg" id="seg-push-skip"><button data-v="5">بعد 5 ث</button><button class="on" data-v="10">بعد 10 ث</button><button data-v="15">بعد 15 ث</button><button data-v="0">بدون تخطي</button></div>
@@ -2893,13 +2992,23 @@ function buildCtl() {
     setSeg('#seg-push-skip', b.dataset.v); skip = +b.dataset.v;
   });
   $('#ctl-send').onclick = async () => {
-    const val = $('#ctl-vid').value;
-    if (!val) return toast('اختر فيديو من السحابة أولاً');
-    const item = val[0] === 'v' ? state.cloud.find(x => x.id === val.slice(2)) : state.cloudAds.find(x => x.id === val.slice(2));
+    const val = $('#ctl-vid').value, link = $('#ctl-yt').value.trim();
+    let item = null;
+    if (link) {
+      const pp = ytParse(link); if (!pp) return toast('رابط يوتيوب غير صحيح');
+      item = { ytId: pp.id, title: '' };
+    } else {
+      if (!val) return toast('اختر فيديو أو الصق رابط يوتيوب');
+      const id = val.slice(2);
+      item = val[0] === 'a' ? state.cloudAds.find(x => x.id === id) : (val[0] === 'y' ? state.all.find(x => x.id === id) : state.cloud.find(x => x.id === id));
+    }
     if (!item) return toast('الفيديو غير موجود');
     const title = $('#ctl-title').value.trim() || item.title || 'إعلان';
+    const msg = { id: uid(), title, skip, ts: CL.ts };
+    if (item.ytId) msg.ytId = item.ytId; else msg.url = item.url;
     try {
-      await withTimeout(CL.db.ref('control/kid/push').set({ id: uid(), url: item.url, title, skip, ts: CL.ts }));
+      await withTimeout(CL.db.ref('control/kid/push').set(msg));
+      $('#ctl-yt').value = '';
       toast('تم الإرسال لجهاز الطفل ✓');
     } catch (x) { toast('تعذر الإرسال'); }
   };
