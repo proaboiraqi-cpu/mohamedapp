@@ -1,5 +1,5 @@
 // يخزّن ملفات التطبيق حتى يفتح بدون إنترنت. الفيديوهات تنحفظ بشكل منفصل داخل التطبيق (IndexedDB).
-const CACHE = 'utyub-v7';
+const CACHE = 'utyub-v8';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'cloud.js', 'manifest.json',
   'logo.png', 'wordmark.png', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'

@@ -201,7 +201,7 @@ async function getVideoSrc(v) {
 }
 // إذا ما اكو صورة مصغرة: نعرض أول لقطة من الفيديو نفسه (تشتغل حتى بدون CORS)
 function frameThumb(img, v) {
-  if (!v.url || img.dataset.fb) return false;
+  if (!v.url || v.ytId || img.dataset.fb) return false;
   img.dataset.fb = '1';
   const vd = document.createElement('video');
   vd.muted = true; vd.preload = 'metadata'; vd.playsInline = true;
@@ -304,6 +304,138 @@ $('#view-home').addEventListener('scroll', () => {
   const v = $('#view-home');
   if (v.scrollTop + v.clientHeight > v.scrollHeight - 900) addHomeBatch();
 }, { passive: true });
+
+/* ================= يوتيوب: مشغل مضمّن داخل sandbox ================= */
+// الـ sandbox بدون allow-popups و allow-top-navigation: المتصفح نفسه يمنع المشغل من فتح يوتيوب أو أي صفحة ثانية
+function ytParse(input) {
+  const t = String(input || '').trim();
+  if (/^[\w-]{11}$/.test(t)) return { id: t, short: false };
+  let u; try { u = new URL(/^https?:\/\//i.test(t) ? t : 'https://' + t); } catch (e) { return null; }
+  const h = u.hostname.replace(/^(www|m|music)\./, '');
+  let id = '', short = false;
+  if (h === 'youtu.be') id = u.pathname.split('/')[1] || '';
+  else if (h === 'youtube.com' || h === 'youtube-nocookie.com') {
+    if (u.pathname === '/watch') id = u.searchParams.get('v') || '';
+    else { const m = u.pathname.match(/^\/(shorts|embed|live|v)\/([\w-]{11})/); if (m) { id = m[2]; short = m[1] === 'shorts'; } }
+  }
+  return /^[\w-]{11}$/.test(id) ? { id, short } : null;
+}
+function ytURL(id, o) {
+  const q = new URLSearchParams({
+    autoplay: o.autoplay ? '1' : '0', controls: o.controls ? '1' : '0', fs: o.controls ? '1' : '0',
+    rel: '0', loop: '1', playlist: id, playsinline: '1', iv_load_policy: '3', disablekb: '1',
+    modestbranding: '1', enablejsapi: '1', hl: 'ar', cc_load_policy: '0'
+  });
+  if (/^https?:/.test(location.origin)) q.set('origin', location.origin);
+  return 'https://www.youtube-nocookie.com/embed/' + id + '?' + q.toString();
+}
+function ytFrame(id, o) {
+  const f = document.createElement('iframe');
+  f.className = 'yt-frame' + (o.short ? ' sh' : '');
+  f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation');
+  f.setAttribute('allow', 'autoplay; encrypted-media; fullscreen');
+  f.setAttribute('allowfullscreen', '');
+  f.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+  f.setAttribute('title', 'فيديو');
+  f.src = ytURL(id, o);
+  return f;
+}
+let ytApiP = null;
+function ytApi() {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (ytApiP) return ytApiP;
+  ytApiP = new Promise((res, rej) => {
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => { try { if (prev) prev(); } catch (e) {} res(window.YT); };
+    const sc = document.createElement('script');
+    sc.src = 'https://www.youtube.com/iframe_api';
+    sc.onerror = () => { ytApiP = null; rej(new Error('yt api')); };
+    document.head.appendChild(sc);
+    setTimeout(() => { if (!(window.YT && window.YT.Player)) { ytApiP = null; rej(new Error('yt api timeout')); } }, 20000);
+  });
+  return ytApiP;
+}
+const ytErrMsg = c => (c === 101 || c === 150 || c === 153) ? 'صاحب الفيديو ما يسمح بتشغيله هنا' : (c === 100 || c === 2) ? 'الفيديو غير متوفر' : 'تعذر تشغيل الفيديو';
+// يربط المشغل بواجهة يوتيوب الرسمية: تكرار تلقائي، إيقاف، ورسالة إذا الفيديو ممنوع من التضمين
+function ytAttach(frame, h) {
+  const c = { p: null, dead: false };
+  ytApi().then(YT => {
+    if (c.dead) return;
+    c.p = new YT.Player(frame, { events: {
+      onStateChange: e => { if (e.data === 0) { try { c.p.seekTo(0, true); c.p.playVideo(); } catch (x) {} } },
+      onError: e => { if (h && h.onError) h.onError(e.data); }
+    } });
+  }).catch(() => {});
+  c.pause = () => { try { if (c.p && c.p.pauseVideo) c.p.pauseVideo(); } catch (e) {} };
+  c.play = () => { try { if (c.p && c.p.playVideo) c.p.playVideo(); } catch (e) {} };
+  c.kill = () => { c.dead = true; try { if (c.p && c.p.destroy) c.p.destroy(); } catch (e) {} };
+  return c;
+}
+function ytThumb(id) {
+  const base = 'https://i.ytimg.com/vi/' + id + '/';
+  return new Promise(res => {
+    const im = new Image();
+    const t = setTimeout(() => res(base + 'mqdefault.jpg'), 4000);
+    im.onload = () => { clearTimeout(t); res(im.naturalWidth >= 640 ? base + 'maxresdefault.jpg' : base + 'mqdefault.jpg'); };
+    im.onerror = () => { clearTimeout(t); res(base + 'mqdefault.jpg'); };
+    im.src = base + 'maxresdefault.jpg';
+  });
+}
+async function ytTitle(id) {
+  try {
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 4000);
+    const r = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + id), { signal: ac.signal });
+    clearTimeout(t);
+    const j = await r.json();
+    return (j && j.title) ? String(j.title).trim() : '';
+  } catch (e) { return ''; }
+}
+function dropYtFrame() {
+  if (W.yt) { W.yt.kill(); W.yt = null; }
+  const f = $('#yt-frame'); if (f) f.remove();
+}
+function stopYtWatch() { dropYtFrame(); $('#watch').classList.remove('yt'); }
+function mountWatchYt(v) {
+  dropYtFrame();
+  const f = ytFrame(v.ytId, { autoplay: true, controls: true });
+  f.id = 'yt-frame';
+  W.player.appendChild(f);
+  W.yt = ytAttach(f, { onError: c => toast(ytErrMsg(c)) });
+}
+function openYtWatch(v, first, wasMini) {
+  const old = W.url; W.url = null;
+  W.cur = v;
+  dropYtFrame();
+  const vid = W.vid; vid.pause(); vid.removeAttribute('src'); vid.load();
+  if (old) URL.revokeObjectURL(old);
+  $('#watch').hidden = false;
+  $('#watch').classList.add('yt');
+  setMini(false);
+  if (first || wasMini) history.pushState({ w: 1 }, '');
+  fillWatchInfo(v);
+  // إعلان الموقع (إن وجد) يخلص أولاً، وبعدها ينفتح مشغل يوتيوب (ما ننحط شي فوق المشغل وهو شغال)
+  const ad = pickAd(v);
+  if (ad) {
+    W.ad = runAd(W.player, ad, {
+      onBack: () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else closeWatch(); },
+      onEnd: () => { W.ad = null; if (W.cur === v) mountWatchYt(v); }
+    });
+  } else mountWatchYt(v);
+  addHistory(v.id);
+  $('.watch-info').scrollTop = 0;
+}
+function mountShortYt(s) {
+  if (s._yt) return;
+  const v = state.byId.get(s.dataset.id); if (!v || !v.ytId) return;
+  const f = ytFrame(v.ytId, { autoplay: true, controls: false, short: true });
+  s.insertBefore(f, s.firstChild);
+  s._ytf = f;
+  s._yt = ytAttach(f, { onError: c => toast(ytErrMsg(c)) });
+}
+function unmountShortYt(s) {
+  if (s._yt) { s._yt.kill(); s._yt = null; }
+  if (s._ytf) { s._ytf.remove(); s._ytf = null; }
+}
 
 /* ================= الإعلانات ================= */
 function adLogGet() {
@@ -417,7 +549,7 @@ function attachShort(s) {
   if (s._p) return s._p;
   const tok = s._tok;
   s._p = (async () => {
-    const v = state.byId.get(s.dataset.id); if (!v) return;
+    const v = state.byId.get(s.dataset.id); if (!v || v.ytId) return;
     const r = await getVideoSrc(v);
     if (s._tok !== tok || !s.isConnected) { if (r.obj) URL.revokeObjectURL(r.url); return; }
     s._res = r;
@@ -427,6 +559,7 @@ function attachShort(s) {
 }
 function detachShort(s) {
   s._tok++; s._p = null;
+  unmountShortYt(s);
   const vd = $('video', s); if (!vd) return;
   if (s._res) {
     vd.pause(); vd.removeAttribute('src'); vd.load();
@@ -436,6 +569,12 @@ function detachShort(s) {
 }
 function killShortAd(s) { if (s._ad) { s._ad.kill(); s._ad = null; } }
 async function startShort(s) {
+  if (s.classList.contains('yt')) {
+    mountShortYt(s);
+    clearTimeout(s._ht);
+    s._ht = setTimeout(() => { if (activeShort === s) addHistory(s.dataset.id); }, 1500);
+    return;
+  }
   const vd = $('video', s);
   vd.muted = state.muted;
   try { await vd.play(); }
@@ -463,6 +602,7 @@ async function playShort(s) {
 function pauseShorts() {
   $$('.short').forEach(killShortAd);
   $$('.short video').forEach(v => v.pause());
+  $$('.short.yt').forEach(unmountShortYt);
   activeShort = null;
 }
 const loadObs = new IntersectionObserver(entries => {
@@ -479,6 +619,7 @@ const playObs = new IntersectionObserver(entries => {
       if (!s.nextElementSibling || !s.nextElementSibling.nextElementSibling) appendShorts();
     } else {
       killShortAd(s);
+      unmountShortYt(s);
       vd.pause();
       if (activeShort === s) activeShort = null;
     }
@@ -487,15 +628,17 @@ const playObs = new IntersectionObserver(entries => {
 
 function addShort(v) {
   const s = document.createElement('section');
-  s.className = 'short'; s.dataset.id = v.id; s._tok = 0;
-  s.innerHTML = `<video playsinline webkit-playsinline loop preload="none"></video>
+  const yt = !!v.ytId;
+  s.className = 'short' + (yt ? ' yt' : ''); s.dataset.id = v.id; s._tok = 0;
+  s.innerHTML = `<video playsinline webkit-playsinline loop preload="none"${yt ? ' hidden' : ''}></video>
       <div class="s-shade"></div>
       <div class="s-flash"></div>
       <div class="s-actions">
+        ${yt ? `<button class="s-btn up" data-nav="-1">${svg('down')}<span>السابق</span></button>` : ''}
         <button class="s-btn" data-toggle="like">${svg('like')}<span>أعجبني</span></button>
         <button class="s-btn" data-toggle="dislike">${svg('dislike')}<span>لا يعجبني</span></button>
-        <button class="s-btn">${svg('comment')}<span>تعليق</span></button>
-        <button class="s-btn">${svg('share')}<span>مشاركة</span></button>
+        ${yt ? `<button class="s-btn" data-nav="1">${svg('down')}<span>التالي</span></button>` : `<button class="s-btn">${svg('comment')}<span>تعليق</span></button>
+        <button class="s-btn">${svg('share')}<span>مشاركة</span></button>`}
       </div>
       <div class="s-info">
         <div class="s-ch"><div class="avatar sm">${esc(chInitial())}</div><b>${esc(channel())}</b>
@@ -505,7 +648,7 @@ function addShort(v) {
       <div class="s-prog"><i></i></div>`;
   feed.appendChild(s);
   loadObs.observe(s); playObs.observe(s);
-  thumbURL(v).then(u => { if (u) $('video', s).poster = u; }).catch(() => {});
+  thumbURL(v).then(u => { if (u) { $('video', s).poster = u; if (yt) s.style.background = '#000 url("' + u + '") center 35% / contain no-repeat'; } }).catch(() => {});
 }
 // ترتيب عشوائي في كل مرة تفتح Shorts (وإذا ضغطت على شورت معين يبدأ به)
 function renderShorts(firstId) {
@@ -541,8 +684,10 @@ feed.addEventListener('error', e => {
   if (e.target && e.target.tagName === 'VIDEO' && !e.target.closest('.ad') && e.target.getAttribute('src')) toast('تعذر تشغيل الفيديو');
 }, true);
 feed.addEventListener('click', e => {
+  const nb = e.target.closest('[data-nav]');
+  if (nb) { feed.scrollBy({ top: +nb.dataset.nav * feed.clientHeight, behavior: 'smooth' }); return; }
   if (e.target.closest('button')) return;
-  const s = e.target.closest('.short'); if (!s) return;
+  const s = e.target.closest('.short'); if (!s || s.classList.contains('yt')) return;
   const vd = $('video', s), fl = $('.s-flash', s);
   // إذا المتصفح شغّله بدون صوت، أول ضغطة ترجع الصوت بدل الإيقاف
   if (state.muted || vd.muted) {
@@ -584,7 +729,7 @@ async function renderYou() {
 }
 
 /* ================= صفحة المشاهدة ================= */
-const W = { vid: $('#vid'), ov: $('#p-ov'), player: $('#player'), cur: null, url: null, hideT: null, skT: null, ad: null, mini: false, skipPop: false };
+const W = { vid: $('#vid'), ov: $('#p-ov'), player: $('#player'), cur: null, url: null, hideT: null, skT: null, ad: null, yt: null, mini: false, skipPop: false };
 function killWatchAd() { if (W.ad) { W.ad.kill(); W.ad = null; } }
 let scrub = false;
 
@@ -593,6 +738,8 @@ async function openWatch(id) {
   const first = $('#watch').hidden, wasMini = W.mini;
   killWatchAd();
   pauseShorts();
+  if (v.ytId) return openYtWatch(v, first, wasMini);
+  stopYtWatch();
   let r;
   try { r = await getVideoSrc(v); } catch (e) { toast('تعذر فتح الفيديو'); return; }
   const old = W.url;
@@ -618,6 +765,7 @@ async function openWatch(id) {
 function cleanupWatch() {
   if ($('#watch').hidden) return;
   killWatchAd();
+  stopYtWatch();
   const vid = W.vid;
   vid.pause(); vid.removeAttribute('src'); vid.load();
   if (W.url) { URL.revokeObjectURL(W.url); W.url = null; }
@@ -649,6 +797,7 @@ function setMini(on) {
 }
 function minimizeWatch() {
   if ($('#watch').hidden || W.mini) return;
+  if (W.cur && W.cur.ytId) { closeWatch(); return; } // يوتيوب ما ينصغّر، يسكّر مباشرة
   if (history.state && history.state.w) {
     W.skipPop = true; setTimeout(() => { W.skipPop = false; }, 700);
     history.back();
@@ -666,6 +815,7 @@ function exitPlayer() {
   if (W.ad) { closeWatch(); return; }
   minimizeWatch();
 }
+$('#yt-back').addEventListener('click', e => { e.stopPropagation(); exitPlayer(); });
 $('#mini-toggle').addEventListener('click', e => { e.stopPropagation(); togglePlay(); });
 $('#mini-close').addEventListener('click', e => { e.stopPropagation(); closeWatch(); });
 $('#watch').addEventListener('click', e => {
@@ -879,12 +1029,12 @@ document.addEventListener('click', e => {
 
 window.addEventListener('popstate', () => {
   if (W.skipPop) { W.skipPop = false; return; }
-  if (!$('#watch').hidden && !W.mini) { if (W.ad) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
+  if (!$('#watch').hidden && !W.mini) { if (W.ad || (W.cur && W.cur.ytId)) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
   else if (!$('#admin').hidden) hideAdmin();
   else if (state.tab === 'shorts') setTab('home', { fromPop: true, refresh: false }); // الرجوع من Shorts يرجع للرئيسية
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { W.vid.pause(); $$('.short video').forEach(v => v.pause()); if (W.ad) W.ad.pause(); }
+  if (document.hidden) { W.vid.pause(); $$('.short video').forEach(v => v.pause()); $$('.short.yt').forEach(unmountShortYt); if (W.yt) W.yt.pause(); if (W.ad) W.ad.pause(); }
   else {
     if (W.ad) W.ad.resume();
     else if (state.tab === 'shorts' && activeShort && $('#watch').hidden && !kidAd) playShort(activeShort);
@@ -1154,18 +1304,25 @@ function buildAdmin() {
     </section>
     <section class="adm-card">
       <h3>إضافة فيديو</h3>
-      <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button></div>
+      <div class="seg" id="seg-src"><button class="on" data-v="file">ملف من الهاتف</button><button data-v="url">رابط</button><button data-v="yt">يوتيوب</button></div>
       <div id="src-file"><label class="filebtn"><input type="file" id="in-file" accept="video/*" hidden><span id="in-file-name">اختر فيديو</span></label></div>
       <div id="src-url" hidden>
         <input id="in-url" type="url" dir="ltr" placeholder="https://..." autocomplete="off">
         <label class="chk" id="in-cloud-row"><input type="checkbox" id="in-cloud"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>
         <label class="chk"><input type="checkbox" id="in-offline"><span>حفظ على الهاتف (يشتغل بدون إنترنت)</span></label>
       </div>
+      <div id="src-yt" hidden>
+        <input id="in-yt" type="url" dir="ltr" placeholder="رابط فيديو يوتيوب" autocomplete="off">
+        <div class="lbl">الصورة المصغرة تنجلب تلقائياً، والعنوان إذا تركته فارغ ينجلب من يوتيوب (وإذا ما انجلب ينكتب عنوان للأطفال تلقائياً). الفيديو يشتغل بمشغل محمي ما يطلع منه الطفل لموقع يوتيوب، ويتكرر لما يخلص بدون فيديوهات مقترحة. يحتاج إنترنت.</div>
+        <label class="chk" id="yt-cloud-row"><input type="checkbox" id="in-cloud-yt"><span>مشاركة بالسحابة (يظهر على كل الأجهزة)</span></label>
+      </div>
       <input id="in-title" type="text" placeholder="العنوان" autocomplete="off">
       <div class="seg" id="seg-kind"><button class="on" data-v="long">فيديو طويل</button><button data-v="short">Short</button></div>
+      <div id="thumb-box">
       <div class="lbl">الصورة المصغرة (اختياري، وإذا تركتها تنأخذ من الفيديو تلقائياً)</div>
       <label class="filebtn"><input type="file" id="in-thumb" accept="image/*" hidden><span id="in-thumb-name">اختر صورة من الهاتف</span></label>
       <input id="in-thumburl" type="url" dir="ltr" placeholder="أو رابط صورة" autocomplete="off">
+      </div>
       <label class="chk" id="in-compress-row"><input type="checkbox" id="in-compress" checked><span>ضغط الفيديو بأقوى درجة (يوفر مساحة كبيرة)</span></label>
       <button class="primary" id="adm-add">إضافة</button>
       <div id="adm-status"></div>
@@ -1198,7 +1355,16 @@ function buildAdmin() {
   if (!canCompress()) { $('#in-compress').checked = false; $('#in-compress-row').hidden = true; }
   $('#in-cloud').onchange = e => { if (e.target.checked) $('#in-offline').checked = false; };
   $('#in-offline').onchange = e => { if (e.target.checked) $('#in-cloud').checked = false; };
-  seg('#seg-src', v => { adm.src = v; $('#src-file').hidden = v !== 'file'; $('#src-url').hidden = v !== 'url'; $('#in-compress-row').hidden = v !== 'file' || !canCompress(); });
+  $('#yt-cloud-row').hidden = !CL.ok;
+  seg('#seg-src', v => {
+    adm.src = v; $('#src-file').hidden = v !== 'file'; $('#src-url').hidden = v !== 'url'; $('#src-yt').hidden = v !== 'yt';
+    $('#thumb-box').hidden = v === 'yt'; $('#in-compress-row').hidden = v !== 'file' || !canCompress();
+  });
+  $('#in-yt').oninput = e => {
+    const p = ytParse(e.target.value); if (!p) return;
+    if (p.short) { adm.kind = 'short'; setSeg('#seg-kind', 'short'); }
+    else if (!adm.kindTouched) { adm.kind = 'long'; setSeg('#seg-kind', 'long'); }
+  };
   seg('#seg-kind', v => { adm.kind = v; adm.kindTouched = true; });
 
   $('#in-file').onchange = e => {
@@ -1396,7 +1562,7 @@ function renderAdminList() {
   box.innerHTML = state.all.map(v => `
     <div class="arow" data-id="${v.id}">
       <div class="at${v.kind === 'short' ? ' vert' : ''}"><img alt="" data-vid="${v.id}"></div>
-      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) + (v.compressed ? ' (مضغوط)' : '') : (v.cloud ? ' • سحابة' : ' • رابط')}</small></div>
+      <div class="ti"><b>${esc(v.title)}</b><small>${v.kind === 'short' ? 'Short' : 'طويل'}${v.duration ? ' • ' + fmtDur(v.duration) : ''}${v.hasBlob ? ' • على الهاتف ' + fmtSize(v.size) + (v.compressed ? ' (مضغوط)' : '') : (v.ytId ? ' • يوتيوب' + (v.cloud ? ' (سحابة)' : '') : (v.cloud ? ' • سحابة' : ' • رابط'))}</small></div>
       <button class="icon-btn danger" data-del="${v.id}" aria-label="حذف">${svg('trash')}</button>
     </div>`).join('');
   fillThumbs(box);
@@ -1415,17 +1581,39 @@ function renderAdminList() {
 async function onAdd() {
   if (adm.busy) return;
   if (batch.running) return toast('الإضافة الجماعية شغالة، انتظر تخلص');
+  const isYt = adm.src === 'yt';
   const isFile = adm.src === 'file';
   const url = $('#in-url').value.trim();
-  if (isFile && !adm.file) return toast('اختر فيديو أولاً');
-  if (!isFile && !/^https?:\/\//i.test(url)) return toast('اكتب رابط صحيح');
+  let yp = null;
+  if (isYt) { yp = ytParse($('#in-yt').value); if (!yp) return toast('اكتب رابط يوتيوب صحيح'); }
+  else if (isFile && !adm.file) return toast('اختر فيديو أولاً');
+  else if (!isFile && !/^https?:\/\//i.test(url)) return toast('اكتب رابط صحيح');
   adm.busy = true; $('#adm-add').disabled = true;
-  try { await doAdd(isFile, url); }
+  try { await (isYt ? doAddYt(yp) : doAdd(isFile, url)); }
   catch (e) {
     console.error(e);
     toast(e && e.name === 'QuotaExceededError' ? 'مساحة الهاتف ممتلئة' : 'صار خطأ، حاول مرة ثانية');
     adm.busy = false; const b = $('#adm-add'); if (b) b.disabled = false; setStatus('');
   }
+}
+
+async function doAddYt(p) {
+  const toCloud = CL.ok && $('#in-cloud-yt') && $('#in-cloud-yt').checked;
+  setStatus('جاري جلب معلومات الفيديو…');
+  let title = $('#in-title').value.trim();
+  if (!title) title = await ytTitle(p.id);
+  if (!title) title = kidTitle(new Set(state.all.map(v => v.title)));
+  const thumbUrl = await ytThumb(p.id);
+  const meta = {
+    id: uid(), title, kind: p.short ? 'short' : adm.kind, src: 'yt', url: 'https://www.youtube.com/watch?v=' + p.id, ytId: p.id,
+    hasBlob: false, thumbUrl, hasThumb: false, duration: 0, created: Date.now(), size: 0
+  };
+  setStatus('جاري الحفظ…');
+  if (toCloud) await withTimeout(CL.db.ref('videos/' + meta.id).set(meta));
+  else { await saveVideo(meta, {}); await loadVideos(); }
+  refreshAll();
+  buildAdmin();
+  toast('تمت إضافة فيديو يوتيوب ✓');
 }
 
 async function doAdd(isFile, url) {
@@ -1677,6 +1865,10 @@ function showKidAd(p) {
   const sv = state.tab === 'shorts' && activeShort ? $('video', activeShort) : null;
   const shortPlaying = !!(sv && !sv.paused);
   const siteAd = W.ad;
+  const ytShort = state.tab === 'shorts' && activeShort && activeShort.classList.contains('yt') ? activeShort : null;
+  const ytW = !!W.yt && !$('#watch').hidden;
+  if (ytShort) unmountShortYt(ytShort);
+  if (ytW) W.yt.pause();
   W.vid.pause(); $$('.short video').forEach(v => v.pause());
   if (siteAd) siteAd.pause();
   const ad = { id: 'push-' + p.id, title: p.title || 'إعلان', advertiser: p.advertiser || '', desc: p.desc || '', url: p.url, skip: +p.skip || 0, noCta: true };
@@ -1687,6 +1879,8 @@ function showKidAd(p) {
       if (siteAd && W.ad === siteAd) siteAd.resume();
       else if (watching && W.cur) W.vid.play().catch(() => {});
       if (shortPlaying && sv) sv.play().catch(() => {});
+      if (ytShort && activeShort === ytShort) startShort(ytShort);
+      if (ytW && W.yt) W.yt.play();
     }
   });
   ctl._box = box; kidAd = ctl;
@@ -1700,7 +1894,7 @@ function updCtlStatus() {
   el.textContent = Date.now() - local < 60000 ? '🟢 جهاز الطفل متصل الآن' : '⚪ آخر ظهور لجهاز الطفل: ' + rel(local);
 }
 function cloudOptions() {
-  const vids = state.cloud.slice().sort((a, b) => b.created - a.created);
+  const vids = state.cloud.filter(v => !v.ytId).sort((a, b) => b.created - a.created);
   const ads = state.cloudAds;
   return vids.map(v => `<option value="v:${esc(v.id)}">${esc(v.title)}</option>`).join('')
     + ads.map(a => `<option value="a:${esc(a.id)}">إعلان: ${esc(a.title)}</option>`).join('');
