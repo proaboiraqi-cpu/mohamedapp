@@ -1195,6 +1195,7 @@ document.addEventListener('click', e => {
 });
 
 window.addEventListener('popstate', () => {
+  if (gateEl) { try { history.pushState({ g: 1 }, ''); } catch (e) {} return; } // أثناء اللعبة زر الرجوع ما يسوي شي
   if (W.skipPop) { W.skipPop = false; return; }
   if (!$('#watch').hidden && !W.mini) { if (W.ad) cleanupWatch(); else setMini(true); } // زر الرجوع يصغّر الفيديو
   else if (!$('#admin').hidden) hideAdmin();
@@ -2062,7 +2063,7 @@ async function runYtBatch(ex, toCloud) {
 // كل لعبة: سؤال + صورة صحيحة + صورة خطأ + جائزة اختيارية. بعد ما يخلص (فوز، غلط عدة مرات، أو تأخر) يطلع مربع الفيديو.
 const LN = { local: { games: [], settings: {} }, cloud: { games: [], settings: {} }, games: [], cfg: {}, last: '' };
 const LN_DEF = { everyN: 3, maxWrong: 3, idleMin: 3, name: '', praise: '' };
-const KIDIMG = { point: 'kid-point.webp', happy: 'kid-happy.webp', clap: 'kid-clap.webp', angry: 'kid-angry.webp' };
+const KIDIMG = { point: 'kid-point.webp', happy: 'kid-happy.webp', clap: 'kid-clap.webp', angry: 'kid-angry.webp', eat: 'kid-eat.webp' };
 const idbPut = (k, v) => { const tx = db.transaction('learn', 'readwrite'); tx.objectStore('learn').put(v, k); return txDone(tx); };
 function learnMerge() {
   const m = new Map();
@@ -2086,17 +2087,52 @@ function lnMark(id, firstTry) {
   st[id] = x; LS.set('lstat', JSON.stringify(st));
 }
 // الصوت: تسجيلاتك أولاً، وإذا ما اكو يستخدم نطق الجهاز
-let lnAudio = null, lnAC = null;
-function lnPlay(url, maxMs) {
+let lnAudio = null, lnAC = null, lnSrc = null, lnTok = 0;
+const lnWait = ms => new Promise(r => setTimeout(r, ms));
+const lnBufs = new Map();
+// يفك الأصوات مسبقاً (مرة وحدة) حتى تشتغل بدون تأخير
+function lnPrep(list) {
+  const ac = lnCtx(); if (!ac) return Promise.resolve();
+  return Promise.all(list.filter(Boolean).map(u => {
+    if (lnBufs.has(u)) return lnBufs.get(u);
+    if (lnBufs.size > 40) lnBufs.clear();
+    const pr = fetch(u).then(r => r.arrayBuffer())
+      .then(ab => new Promise((ok, no) => { const q = ac.decodeAudioData(ab, ok, no); if (q && q.catch) q.catch(no); }))
+      .then(buf => { lnBufs.set(u, buf); return buf; })
+      .catch(() => { lnBufs.delete(u); return null; });
+    lnBufs.set(u, pr);
+    return pr;
+  }));
+}
+function lnStop() {
+  lnTok++;
+  try { if (lnSrc) { const s = lnSrc; lnSrc = null; s.onended = null; try { s.stop(); } catch (e) {} if (s._fin) s._fin(); } } catch (e) {}
+  try { if (lnAudio) lnAudio.pause(); } catch (e) {}
+}
+async function lnPlay(url, maxMs) {
+  lnStop();
+  if (!url) return;
+  const my = lnTok, ac = lnCtx();
+  let b = lnBufs.get(url);
+  if (!b && ac) { lnPrep([url]); b = lnBufs.get(url); }
+  if (b && typeof b.then === 'function') b = await Promise.race([b, lnWait(1500)]);
+  if (my !== lnTok) return;
+  if (ac && b && b.duration) {
+    return new Promise(res => {
+      const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination);
+      let d = false;
+      const fin = () => { if (d) return; d = true; clearTimeout(t); if (lnSrc === s) lnSrc = null; res(); };
+      const t = setTimeout(fin, b.duration * 1000 + 400);
+      s._fin = fin; s.onended = fin; lnSrc = s; s.start();
+    });
+  }
   return new Promise(res => {
-    try { if (lnAudio) lnAudio.pause(); } catch (e) {}
-    if (!url) return res();
     const a = lnAudio = new Audio(url);
-    let done = false;
-    const fin = () => { if (done) return; done = true; clearTimeout(t); res(); };
+    let d = false;
+    const fin = () => { if (d) return; d = true; clearTimeout(t); res(); };
     const t = setTimeout(fin, maxMs || 7000);
     a.onended = fin; a.onerror = fin; a.onpause = fin;
-    const p = a.play(); if (p && p.catch) p.catch(fin);
+    const q = a.play(); if (q && q.catch) q.catch(fin);
   });
 }
 function lnSpeak(text) {
@@ -2114,24 +2150,26 @@ function lnCtx() {
   try { lnAC = lnAC || new (window.AudioContext || window.webkitAudioContext)(); if (lnAC.state === 'suspended') lnAC.resume(); return lnAC; }
   catch (e) { return null; }
 }
-function lnClap() {
+// نغمة فرح هادئة (مثل صندوق موسيقى) بصوت منخفض
+function lnChime() {
   const ac = lnCtx(); if (!ac) return;
-  const len = Math.floor(ac.sampleRate * 0.07), buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
-  const t0 = ac.currentTime;
-  for (let k = 0; k < 14; k++) {
-    const src = ac.createBufferSource(); src.buffer = buf;
-    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1200 + Math.random() * 1800;
-    const g = ac.createGain(); g.gain.value = 0.25 + Math.random() * 0.25;
-    src.connect(f); f.connect(g); g.connect(ac.destination);
-    src.start(t0 + k * 0.1 + Math.random() * 0.06);
-  }
+  const t0 = ac.currentTime + 0.03, notes = [523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5];
+  const m = ac.createGain(); m.gain.value = 0.14; m.connect(ac.destination);
+  notes.forEach((f, i) => {
+    const t = t0 + i * 0.17 + (i > 3 ? 0.15 : 0);
+    [1, 2].forEach((h, j) => {
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.value = f * h;
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(j ? 0.12 : 0.6, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+      o.connect(g); g.connect(m); o.start(t); o.stop(t + 1);
+    });
+  });
 }
 function lnBoop() {
   const ac = lnCtx(); if (!ac) return;
   const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
   o.type = 'sine'; o.frequency.setValueAtTime(260, t); o.frequency.exponentialRampToValueAtTime(190, t + 0.18);
-  g.gain.setValueAtTime(0.18, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  g.gain.setValueAtTime(0.08, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
   o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + 0.22);
 }
 const lnPlayable = g => !!(g && g.on !== false && g.right && g.wrong && g.right.img && g.wrong.img);
@@ -2178,6 +2216,9 @@ function runGate(v, forced) {
     if (!g) return resolve(false);
     lnPauseAll();
     const c = LN.cfg, nm = (c.name || '').trim();
+    const rw = g.reward && (g.reward.prize || g.reward.place) ? g.reward : null;
+    lnPrep([g.ask, g.right.voice, g.wrong.voice, c.praise, rw && rw.voice]); // تجهيز الأصوات مسبقاً حتى تشتغل فوراً
+    if (rw) { const im = new Image(); im.src = KIDIMG.eat; }
     const root = gateEl = document.createElement('div');
     root.id = 'gate'; root.className = 'gate';
     root.innerHTML = `<button class="g-skip" aria-label=""></button>
@@ -2185,17 +2226,22 @@ function runGate(v, forced) {
       <div class="g-bub"><span class="g-txt"></span><button class="g-say" aria-label="سماع">${svg('volume')}</button></div></div>
       <div class="g-stage"></div>`;
     document.body.appendChild(root);
+    try { history.pushState({ g: 1 }, ''); } catch (e) {} // زر الرجوع ما يطلعه من اللعبة
     const stage = $('.g-stage', root), txt = $('.g-txt', root), bub = $('.g-bub', root), kid = $('.g-kid', root);
     const timers = new Set();
-    let idleIv = 0, done = false, phase = 'quiz', busy = false, sayNow = () => {}, lastAct = Date.now(), nudged = 0;
+    let idleIv = 0, swIv = 0, done = false, phase = 'quiz', busy = false, sayNow = () => {}, lastAct = Date.now(), nudged = 0;
     const later = (fn, ms) => { const t = setTimeout(() => { timers.delete(t); if (!done) fn(); }, ms); timers.add(t); return t; };
     const clearT = t => { clearTimeout(t); timers.delete(t); };
-    const stopSound = () => { try { if (lnAudio) lnAudio.pause(); if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {} };
-    const setKid = k => { if (kid.dataset.k === k) return; kid.dataset.k = k; kid.src = KIDIMG[k]; kid.classList.remove('pop'); void kid.offsetWidth; kid.classList.add('pop'); };
+    const stopSound = () => { lnStop(); try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {} };
+    const setKid = k => {
+      if (kid.dataset.k === k) return;
+      kid.dataset.k = k; kid.src = KIDIMG[k]; kid.classList.toggle('eat', k === 'eat');
+      kid.classList.remove('pop'); void kid.offsetWidth; kid.classList.add('pop');
+    };
     const say = t => { txt.textContent = t; bub.classList.remove('pop'); void bub.offsetWidth; bub.classList.add('pop'); };
     const finish = r => {
       if (done) return; done = true;
-      timers.forEach(clearTimeout); timers.clear(); clearInterval(idleIv); stopSound();
+      timers.forEach(clearTimeout); timers.clear(); clearInterval(idleIv); clearInterval(swIv); stopSound();
       root.remove(); gateEl = null;
       if (!forced) LS.set('gcnt', '0');
       resolve(r);
@@ -2246,8 +2292,9 @@ function runGate(v, forced) {
         busy = true; phase = 'win'; hand.hidden = true;
         rBtn.classList.remove('hint'); rBtn.classList.add('ok'); wBtn.classList.add('dim');
         if (!forced) lnMark(g.id, nWrong === 0);
-        setKid('clap'); lnClap();
-        await lnSay(right.voice, right.name);
+        setKid('happy'); say(right.name || '');
+        // يسمع اسم الشيء الصح مرتين قبل الفرح
+        for (let i = 0; i < 2 && !done; i++) { await lnSay(right.voice, right.name); if (!done) await lnWait(250); }
         if (!done) party();
       } else {
         busy = true; nWrong++;
@@ -2271,52 +2318,53 @@ function runGate(v, forced) {
       setKid('point');
       const t = 'هذا ' + (right.name || '');
       say(t); sayNow = () => lnSay(right.voice, right.name);
-      await lnSay(right.voice, right.name);
-      if (!done) later(() => videoBox(false), 1500);
+      await sayNow();
+      if (!done) later(() => showVideo(false), 1000);
     };
 
-    /* ---- 2) الفوز: عافية + تصفيق ---- */
+    /* ---- 2) الفوز: عافية + أكل يتناثر + صوت هادئ ---- */
     const party = () => {
       phase = 'party';
-      setKid('happy');
       const t = 'عافية' + (nm ? ' ' + nm : '') + '!';
       say(t);
+      const foods = ['🍫', '🍉', '🍬', '🧃', '🍪', '🍰', '🍭', '🍩', '🍚', '🍲', '🍎', '🍌'];
       const p = document.createElement('div'); p.className = 'g-conf-w';
-      p.innerHTML = Array.from({ length: 14 }, (_, i) => `<i class="g-conf ga" style="left:${2 + i * 7}%;animation-delay:${(i % 5) * 0.2}s;font-size:${26 + (i % 3) * 9}px">${['⭐', '🎉', '✨', '🎈', '💛'][i % 5]}</i>`).join('');
+      p.innerHTML = Array.from({ length: 16 }, (_, i) => `<i class="g-conf ga" style="left:${(i % 8) * 12 + 3}%;animation-delay:${(i >= 8 ? 1.2 : 0) + ((i * 3) % 8) * 0.1}s">${foods[(i * 5) % foods.length]}</i>`).join('');
       root.appendChild(p);
-      lnClap(); later(lnClap, 1400);
-      sayNow = () => lnSay(c.praise, t); sayNow();
-      const rw = g.reward && (g.reward.prize || g.reward.place) ? g.reward : null;
-      later(() => { p.remove(); rw ? reward(rw) : videoBox(true); }, 3600);
+      lnChime();
+      setKid('clap');
+      let k = 0;
+      swIv = setInterval(() => { if (done || phase !== 'party') { clearInterval(swIv); return; } setKid(++k % 2 ? 'happy' : 'clap'); }, 850);
+      sayNow = () => lnSay(c.praise, t);
+      later(() => { if (phase === 'party') sayNow(); }, 450);
+      later(() => { clearInterval(swIv); p.remove(); if (rw) reward(rw); else finish('won'); }, 4300);
     };
 
-    /* ---- 3) الجائزة (اختيارية) ---- */
+    /* ---- 3) الجائزة: محمد ياكل + الولد يأشر على الجائزة + الفيديو تحت ---- */
     const reward = r => {
-      phase = 'reward';
+      phase = 'reward'; root.classList.add('rwd');
       const t = (r.text || '').trim() || 'روح جيب الجائزة!';
-      say(t); setKid('point');
-      const both = r.place && r.prize;
-      stage.innerHTML = `<div class="g-rw${both ? '' : ' one'}">
-        ${both ? `<div class="g-rwc"><span class="g-sq"><img alt="" src="${r.place}"></span></div><div class="g-arrow"><span class="ga">${G_ARROW}</span></div>` : ''}
-        <div class="g-rwc prize"><span class="g-sq"><img alt="" src="${r.prize || r.place}"></span></div></div>
-        <button class="g-next" hidden>التالي ◀</button>`;
-      sayNow = () => lnSay(r.voice, t); sayNow();
-      const nx = $('.g-next', stage);
-      later(() => { nx.hidden = false; }, 4000);
-      nx.onclick = () => videoBox(true);
+      say(t); setKid('eat');
+      const main = r.prize || r.place, inset = r.prize && r.place ? r.place : '';
+      stage.innerHTML = `<div class="g-rwm"><img class="g-pt" alt="" src="${KIDIMG.point}">
+        <div class="g-prz"><img class="g-prz-i" alt="" src="${main}">${inset ? `<span class="g-plc"><img alt="" src="${inset}"><i>📍</i></span>` : ''}<span class="g-rwar"><span class="ga">${G_ARROW}</span></span></div></div>`;
+      sayNow = () => lnSay(r.voice, t);
+      $('.g-prz', stage).onclick = () => { stopSound(); sayNow(); };
+      const t0 = Date.now();
+      (async () => { await sayNow(); if (!done && phase === 'reward') later(() => showVideo(true), Math.max(700, 3000 - (Date.now() - t0))); })();
     };
 
-    /* ---- 4) مربع الفيديو: يضغط عليه ويشتغل الفيديو من البداية ---- */
-    const videoBox = async won => {
+    /* ---- 4) الفيديو تحت مثل يوتيوب + إصبع يأشر عليه، يضغط ويشتغل ---- */
+    const showVideo = async won => {
       if (phase === 'video') return;
-      phase = 'video'; stopSound();
-      setKid(won ? 'happy' : 'point');
-      say(v ? 'يلا نشوف الفيديو!' : 'انتهت المعاينة');
-      sayNow = () => {}; $('.g-say', root).hidden = true;
-      stage.innerHTML = `<button class="g-vid"><span class="g-thumb">${v ? '<img alt="" hidden>' : ''}<span class="g-play ga">${G_PLAY}</span></span><span class="g-vt">${v ? esc(v.title || '') : 'إغلاق'}</span></button>`;
-      $('.g-vid', stage).onclick = () => finish(won ? 'won' : 'lost');
+      phase = 'video';
+      const w = document.createElement('div'); w.className = 'g-ytw';
+      w.innerHTML = `<button class="g-yt"><span class="g-ytt"><img alt="" hidden><span class="g-ytp">${G_PLAY}</span>${v && v.duration ? `<span class="g-ytd">${fmtDur(v.duration)}</span>` : ''}</span>
+        <span class="g-ytm"><b>${v ? esc(v.title || '') : 'انتهت المعاينة'}</b><small>${v ? esc(channel()) : 'اضغط للإغلاق'}</small></span></button><span class="g-hand g-hand2 ga">👆</span>`;
+      stage.appendChild(w);
+      $('.g-yt', w).onclick = () => finish(won ? 'won' : 'lost');
       if (v) {
-        const u = await gateThumb(v), im = $('.g-thumb img', stage);
+        const u = await gateThumb(v), im = $('.g-ytt img', w);
         if (im && u) { im.onload = () => { im.hidden = false; }; im.src = u; }
       }
     };
@@ -2552,7 +2600,7 @@ const GATE_CSS = `
 .g-say{position:absolute;left:10px;top:50%;margin-top:-23px;width:46px;height:46px;border-radius:50%;background:#3ea6ff;color:#fff;display:grid;place-items:center;box-shadow:0 4px 0 #1f7fd1}
 .g-say svg{width:28px;height:28px}
 .g-stage{position:relative;flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.g-opts{display:flex;flex-direction:column;gap:16px;width:100%;height:100%;max-width:620px}
+.g-opts{display:flex;flex-direction:column;gap:16px;width:100%;flex:1;min-height:0;max-width:620px}
 .g-opt{position:relative;flex:1;min-height:0;display:flex;align-items:center;gap:12px;background:#fff;border-radius:28px;padding:10px;box-shadow:var(--sh)}
 .g-opt:active{transform:translateY(3px)}
 .g-pic{height:100%;aspect-ratio:1;max-width:64%;border-radius:20px;overflow:hidden;background:#f1f6fb;flex:none;display:block}
@@ -2566,7 +2614,7 @@ const GATE_CSS = `
 .g-opt.no .g-badge{display:grid;background:#ff5a5a}.g-opt.no .g-badge::after{content:'✕'}
 .g-hand{position:absolute;font-size:66px;line-height:1;pointer-events:none;z-index:3;filter:drop-shadow(0 4px 4px rgba(0,0,0,.25))}
 .g-conf-w{position:absolute;inset:0;pointer-events:none;z-index:6;overflow:hidden}
-.g-conf{position:absolute;top:-70px;font-style:normal;line-height:1}
+.g-conf{position:absolute;top:-70px;font-style:normal;line-height:1;font-size:40px}
 .g-rw{display:flex;flex-direction:column;align-items:center;gap:4px;width:100%;flex:1;min-height:0}
 .g-rwc{flex:1;min-height:0;width:100%;display:flex;justify-content:center}
 .g-sq{height:100%;aspect-ratio:1;max-width:100%;background:#fff;border-radius:28px;padding:8px;box-shadow:var(--sh);display:block;box-sizing:border-box}
@@ -2597,7 +2645,7 @@ const GATE_CSS = `
 #gate#gate .g-opt.shake{animation:gshake .45s!important}
 #gate#gate .g-opt.ok{animation:gwin .6s ease-out!important}
 #gate#gate .g-hand.ga{animation:gtap .9s ease-in-out infinite!important}
-#gate#gate .g-conf.ga{animation:gfall 2.6s linear infinite!important}
+#gate#gate .g-conf.ga{animation:gfall 2.7s ease-in both!important}
 #gate#gate .g-arrow .ga{animation:garrow 1s ease-in-out infinite!important}
 #gate#gate .g-play.ga{animation:gpulse2 1.2s ease-in-out infinite!important}
 @keyframes gbob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
@@ -2608,8 +2656,36 @@ const GATE_CSS = `
 @keyframes gwin{0%{transform:scale(1)}50%{transform:scale(1.06)}100%{transform:scale(1)}}
 @keyframes gshake{20%{transform:translateX(-10px)}40%{transform:translateX(10px)}60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
 @keyframes gtap{0%,100%{transform:translateY(0)}50%{transform:translateY(-20px)}}
-@keyframes gfall{0%{transform:translateY(0) rotate(0)}100%{transform:translateY(120vh) rotate(200deg)}}
+@keyframes gfall{0%{transform:translateY(0) rotate(-15deg)}100%{transform:translateY(125vh) rotate(25deg)}}
 @keyframes garrow{0%,100%{transform:translateY(-4px)}50%{transform:translateY(6px)}}
+.gate.rwd .g-head{height:clamp(150px,30vh,270px)}
+.g-kid.eat{border-radius:22px;border:5px solid #fff;box-shadow:0 8px 20px rgba(30,60,120,.25);filter:none;box-sizing:border-box}
+.g-rwm{flex:1;min-height:0;width:100%;max-width:620px;display:flex;direction:ltr;align-items:flex-end;justify-content:center}
+.g-pt{height:88%;width:auto;flex:none;margin-right:-22px;position:relative;z-index:2;filter:drop-shadow(0 6px 5px rgba(0,0,0,.18))}
+.g-prz{position:relative;height:100%;aspect-ratio:1;max-width:calc(100% - 100px);align-self:center;background:#fff;border-radius:30px;padding:8px;box-sizing:border-box;box-shadow:0 0 0 6px #ffd43b,0 7px 0 #e0b200,0 0 44px #ffe066}
+.g-prz-i{width:100%;height:100%;object-fit:cover;border-radius:22px;display:block}
+.g-plc{position:absolute;right:-10px;bottom:-12px;width:38%;aspect-ratio:1;border-radius:18px;border:4px solid #fff;overflow:hidden;box-shadow:0 6px 14px rgba(0,0,0,.25);background:#fff}
+.g-plc img{width:100%;height:100%;object-fit:cover;display:block}
+.g-plc i{position:absolute;top:2px;left:4px;font-size:26px;font-style:normal}
+.g-rwar{position:absolute;left:-30px;top:40%;width:46px;height:46px;color:#ff9f1c;z-index:3;transform:rotate(-90deg)}
+.g-rwar span{display:block;width:100%;height:100%}.g-rwar svg{width:100%;height:100%;display:block;filter:drop-shadow(0 3px 0 #d97a00)}
+.g-ytw{position:relative;flex:none;width:100%;max-width:620px;margin-top:14px}
+.g-yt{width:100%;display:flex;align-items:center;gap:10px;background:#fff;border-radius:18px;padding:8px;box-shadow:var(--sh);text-align:right;color:#1d2b4f}
+.g-ytt{position:relative;width:42%;flex:none;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,#3ea6ff,#7b5cff);display:block}
+.g-ytt img{width:100%;height:100%;object-fit:cover;display:block}
+.g-ytp{position:absolute;left:50%;top:50%;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;background:#ff0033;color:#fff;display:grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.g-ytp svg{width:26px;height:26px;margin-left:3px}
+.g-ytd{position:absolute;left:4px;bottom:4px;background:rgba(0,0,0,.8);color:#fff;font-size:11px;padding:1px 4px;border-radius:4px}
+.g-ytm{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.g-ytm b{font-size:16px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.g-ytm small{font-size:12px;color:#667}
+.g-hand2{right:calc(8px + 21% - 30px);top:48%;font-size:58px}
+#gate#gate .g-kid.eat,#gate#gate .g-kid.eat.pop{animation:geat 1.4s ease-in-out infinite!important}
+#gate#gate .g-pt{animation:gbob 2.2s ease-in-out infinite!important}
+#gate#gate .g-prz{animation:gpulse 1.6s ease-in-out infinite!important}
+#gate#gate .g-rwar .ga{animation:garrow 1s ease-in-out infinite!important}
+#gate#gate .g-ytw{animation:gpop .45s ease-out!important}
+@keyframes geat{0%,100%{transform:rotate(-2deg) scale(1)}50%{transform:rotate(2deg) scale(1.05)}}
 .rec{margin:6px 0}.rec-b{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
 .rec-img{width:110px;height:110px;object-fit:cover;border-radius:14px;margin-top:6px;display:block}
 .rec-img[hidden]{display:none}
