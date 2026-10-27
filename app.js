@@ -437,6 +437,28 @@ function unmountShortYt(s) {
   if (s._ytf) { s._ytf.remove(); s._ytf = null; }
 }
 
+// نفس قواعد يوتيوب بملف style.css، منسوخة هنا حتى تشتغل حتى لو الهاتف عنده نسخة قديمة من الستايل
+function injectYtCss() {
+  if (document.getElementById('yt-css')) return;
+  const st = document.createElement('style'); st.id = 'yt-css';
+  st.textContent = `
+.yt-bar{display:none}
+#watch.yt .yt-bar{display:flex;flex:none;height:40px;align-items:center;padding:0 4px;background:var(--bg)}
+#watch.yt.mini .yt-bar{display:none}
+#watch.yt #vid,#watch.yt .p-overlay,#watch.yt #p-spin,#watch.yt #p-skip{display:none}
+#watch.yt .player{touch-action:auto}
+.yt-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
+@media (orientation:landscape) and (max-height:520px){#watch.yt .yt-bar{display:none}}
+.short.yt video,.short.yt .s-shade,.short.yt .s-prog,.short.yt .s-flash{display:none}
+.short.yt .yt-frame.sh{inset:auto;top:0;left:0;width:100%;height:calc(100% - 136px)}
+.short.yt .s-actions{left:0;right:0;bottom:0;height:62px;flex-direction:row;justify-content:space-around;align-items:center;gap:0}
+.short.yt .s-info{left:12px;right:12px;bottom:66px}
+.short.yt .s-info p{margin-top:6px;-webkit-line-clamp:1}
+.s-btn.up svg{transform:rotate(180deg)}`;
+  document.head.appendChild(st);
+}
+injectYtCss();
+
 /* ================= الإعلانات ================= */
 function adLogGet() {
   try {

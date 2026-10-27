@@ -1,5 +1,5 @@
 // يخزّن ملفات التطبيق حتى يفتح بدون إنترنت. الفيديوهات تنحفظ بشكل منفصل داخل التطبيق (IndexedDB).
-const CACHE = 'utyub-v8';
+const CACHE = 'utyub-v9';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'cloud.js', 'manifest.json',
   'logo.png', 'wordmark.png', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'
@@ -34,7 +34,7 @@ async function handle(e) {
   const req = e.request;
   const cache = await caches.open(CACHE);
   const cached = await cache.match(req, { ignoreSearch: true });
-  const net = fetch(req)
+  const net = fetch(req, { cache: 'no-cache' })
     .then(r => { if (r && r.ok) cache.put(req, r.clone()); return r; })
     .catch(() => null);
   if (cached) { e.waitUntil(net); return cached; }
